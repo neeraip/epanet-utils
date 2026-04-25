@@ -18,6 +18,7 @@ from epanet_utils.exports import (
     SPATIAL_SECTIONS,
     decode_to_data_json,
     emit_report_json,
+    emit_results_parquet,
     encode_with_overlay,
 )
 
@@ -183,3 +184,73 @@ def test_emit_results_zarr_writes_and_reopens(ky5_files, tmp_path):
     assert ds.links.shape[2] == 5
     # spatial sort applied → coordinates should be a permutation, not file order
     assert len(ds.node_feature_id.values) == ds.nodes.shape[0]
+
+
+# ---------------------------------------------------------------------------
+# emit_results_parquet
+# ---------------------------------------------------------------------------
+
+def test_emit_results_parquet_shape_and_types(ky5_files, tmp_path):
+    import pyarrow.parquet as pq
+
+    inp, _, out = ky5_files
+    pq_path = tmp_path / "results.parquet"
+    desc = emit_results_parquet(out, inp, str(pq_path))
+
+    expected_cols = [
+        "fid", "role", "element_type",
+        "period_idx", "period_ts", "period_seconds",
+        "pressure", "head", "demand", "quality",
+        "flow", "velocity", "headloss", "status", "setting",
+    ]
+    assert desc["columns"] == expected_cols
+
+    table = pq.read_table(str(pq_path))
+    assert table.num_rows > 0
+
+    t_schema = {f.name: str(f.type) for f in table.schema}
+    assert t_schema["fid"] == "string"
+    assert t_schema["role"] == "string"
+    assert t_schema["element_type"] == "string"
+    assert t_schema["period_idx"] == "int32"
+    assert t_schema["period_seconds"] == "int32"
+    # pyarrow stringifies timestamps as e.g. "timestamp[ns]".
+    assert t_schema["period_ts"].startswith("timestamp")
+    for m in ("pressure", "head", "flow", "velocity"):
+        assert t_schema[m] == "float"   # float32 → pyarrow "float"
+
+
+def test_emit_results_parquet_null_across_roles(ky5_files, tmp_path):
+    import pyarrow.parquet as pq
+
+    inp, _, out = ky5_files
+    pq_path = tmp_path / "results.parquet"
+    emit_results_parquet(out, inp, str(pq_path))
+
+    df = pq.read_table(str(pq_path)).to_pandas()
+    node_row = df[df["role"] == "node"].iloc[0]
+    link_row = df[df["role"] == "link"].iloc[0]
+
+    # Node rows: link metrics must be NaN.
+    assert all(
+        str(node_row[c]) == "nan" for c in ("flow", "velocity", "headloss")
+    )
+    # Link rows: node metrics must be NaN.
+    assert all(
+        str(link_row[c]) == "nan" for c in ("pressure", "head", "demand")
+    )
+
+
+def test_emit_results_parquet_compression(ky5_files, tmp_path):
+    """Writer settings must match file-ingestion-engine (zstd, row groups)."""
+    import pyarrow.parquet as pq
+
+    inp, _, out = ky5_files
+    pq_path = tmp_path / "results.parquet"
+    emit_results_parquet(out, inp, str(pq_path))
+
+    md = pq.read_metadata(str(pq_path))
+    rg = md.row_group(0)
+    # Every column in the first row group should be zstd.
+    for i in range(rg.num_columns):
+        assert rg.column(i).compression == "ZSTD"

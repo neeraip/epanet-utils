@@ -39,6 +39,7 @@ from .exports import (
     encode_with_overlay,
     emit_report_json,
     emit_results_zarr,
+    emit_results_parquet,
     SPATIAL_SECTIONS,
     NON_SPATIAL_SECTIONS,
 )
@@ -59,6 +60,7 @@ __all__ = [
     "encode_with_overlay",
     "emit_report_json",
     "emit_results_zarr",
+    "emit_results_parquet",
     "SPATIAL_SECTIONS",
     "NON_SPATIAL_SECTIONS",
     # Version

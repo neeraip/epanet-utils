@@ -242,6 +242,209 @@ def _summarize_per_feature(df, id_col: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# .out → results.parquet   (sidecar for file-ingestion-engine query service)
+# ---------------------------------------------------------------------------
+
+# Compression/writer settings mirrored from
+# `neeraip/file-ingestion-engine/ingest/csv_ingest.py`. Keeping them aligned
+# ensures the query service sees the exact shape it does for CSV-origin
+# datasets: zstd-3 blocks, dictionary-encoded strings, 1M-row groups, Spark
+# flavor, statistics for pruning.
+_PARQUET_WRITER_KWARGS: Dict[str, Any] = {
+    "compression": "zstd",
+    "compression_level": 3,
+    "use_dictionary": True,
+    "write_statistics": True,
+    "data_page_size": 1 << 20,     # 1 MB
+    "row_group_size": 1_000_000,
+    "flavor": "spark",
+}
+
+_NODE_METRICS_PARQUET = ("pressure", "head", "demand", "quality")
+_LINK_METRICS_PARQUET = ("flow", "velocity", "headloss", "status", "setting")
+
+# Synthetic timestamp base: period_seconds are added to this to produce
+# period_ts. Synthetic because EPANET simulations are typically elapsed-time
+# (no wall-clock). The query service parses the column as a datetime; the
+# user sees ordinal steps labeled with an arbitrary fixed anchor, which is
+# fine for charts.
+_PERIOD_TS_BASE = "2000-01-01"
+
+
+def emit_results_parquet(
+    out_path: PathLike,
+    inp_path: PathLike,
+    parquet_path: PathLike,
+) -> Dict[str, Any]:
+    """
+    Write simulation time-series to a single Parquet file as a sidecar for
+    the file-ingestion-engine query service. Long-by-period wide-by-metric
+    format: one row per (feature, period). Per-role metric columns are
+    nulled across the other role(s).
+
+    Schema:
+        fid             string (dict)   — EPANET canonical id ("J-101")
+        role            string (dict)   — "node" | "link"
+        element_type    string (dict)   — junction|tank|reservoir|pipe|pump|valve
+        period_idx      int32
+        period_ts       timestamp[us]   — synthetic, base 2000-01-01
+        period_seconds  int32
+        pressure / head / demand / quality         float32  (null for links)
+        flow / velocity / headloss / status / setting  float32  (null for nodes)
+
+    Writer settings match file-ingestion-engine/ingest/csv_ingest.py so the
+    query service reads it indistinguishably from any other Parquet there.
+
+    Args:
+        out_path:     Path to EPANET binary .out.
+        inp_path:     Path to source .inp (for element_type classification).
+        parquet_path: Destination path for the `.parquet` file.
+
+    Returns:
+        Small descriptor dict: row count, column list, n_periods.
+    """
+    try:
+        import numpy as np
+        import pandas as pd
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as e:
+        raise ImportError(
+            "emit_results_parquet requires `pandas` and `pyarrow` (already "
+            "in install_requires — reinstall the package)."
+        ) from e
+
+    # Classify element types from the .inp.
+    element_type_by_id = _classify_element_types(inp_path)
+
+    with EpanetOutput(out_path) as ep:
+        n_periods = ep.num_periods
+        step = ep.report_time_step or 1
+        node_ids_all = list(ep.node_ids)
+        link_ids_all = list(ep.link_ids)
+        nodes_df = ep.nodes_to_dataframe()
+        links_df = ep.links_to_dataframe()
+
+    frames = []
+    if nodes_df is not None and not nodes_df.empty:
+        frames.append(_prepare_role_frame(
+            nodes_df, role="node", metrics=_NODE_METRICS_PARQUET,
+            element_type_by_id=element_type_by_id,
+            step_seconds=int(step),
+        ))
+    if links_df is not None and not links_df.empty:
+        frames.append(_prepare_role_frame(
+            links_df, role="link", metrics=_LINK_METRICS_PARQUET,
+            element_type_by_id=element_type_by_id,
+            step_seconds=int(step),
+        ))
+
+    if not frames:
+        # Produce an empty-but-schema-correct Parquet so downstream code can
+        # always open it.
+        df = pd.DataFrame(columns=_parquet_schema_columns())
+    else:
+        df = pd.concat(frames, ignore_index=True, sort=False)
+
+    # Materialize timestamps from period_seconds.
+    base = pd.Timestamp(_PERIOD_TS_BASE)
+    df["period_ts"] = base + pd.to_timedelta(df["period_seconds"].astype("int64"), unit="s")
+
+    # Enforce types & column order before writing.
+    df = _coerce_parquet_types(df)
+
+    table = pa.Table.from_pandas(df, preserve_index=False)
+
+    out_path_local = Path(parquet_path)
+    out_path_local.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, str(out_path_local), **_PARQUET_WRITER_KWARGS)
+
+    return {
+        "rows": int(len(df)),
+        "columns": list(df.columns),
+        "n_periods": int(n_periods),
+        "report_time_step_seconds": int(step),
+        "node_metrics": list(_NODE_METRICS_PARQUET),
+        "link_metrics": list(_LINK_METRICS_PARQUET),
+    }
+
+
+def _classify_element_types(inp_path: PathLike) -> Dict[str, str]:
+    """Map every node/link id → canonical element_type string."""
+    decoder = EpanetInputDecoder()
+    model = decoder.decode_inp(Path(inp_path))
+    out: Dict[str, str] = {}
+
+    for section, element_type in (
+        ("junctions", "junction"),
+        ("reservoirs", "reservoir"),
+        ("tanks", "tank"),
+        ("pipes", "pipe"),
+        ("pumps", "pump"),
+        ("valves", "valve"),
+    ):
+        for row in model.get(section, []) or []:
+            fid = row.get("id") or row.get("name") or row.get("node")
+            if fid:
+                out[fid] = element_type
+    return out
+
+
+def _parquet_schema_columns() -> list:
+    return [
+        "fid", "role", "element_type",
+        "period_idx", "period_ts", "period_seconds",
+        *_NODE_METRICS_PARQUET,
+        *_LINK_METRICS_PARQUET,
+    ]
+
+
+def _prepare_role_frame(
+    df,
+    *,
+    role: str,
+    metrics: Iterable[str],
+    element_type_by_id: Dict[str, str],
+    step_seconds: int,
+):
+    """Reshape a role-specific dataframe to the common Parquet schema."""
+    import pandas as pd
+
+    metrics = tuple(metrics)
+    # EpanetOutput dataframes have columns: id, period, plus metrics.
+    base_cols = ["id", "period"]
+    keep = [c for c in (*base_cols, *metrics) if c in df.columns]
+    out = df[keep].rename(columns={"id": "fid", "period": "period_idx"}).copy()
+    out["role"] = role
+    out["element_type"] = out["fid"].map(element_type_by_id).fillna(role)
+    out["period_seconds"] = out["period_idx"].astype("int64") * int(step_seconds)
+
+    # Ensure every expected metric column exists (fill missing with NaN so
+    # the concatenated frame has a consistent column set across roles).
+    for m in (*_NODE_METRICS_PARQUET, *_LINK_METRICS_PARQUET):
+        if m not in out.columns:
+            out[m] = pd.NA
+    return out
+
+
+def _coerce_parquet_types(df):
+    """Cast columns to the types expected by the file-ingestion-engine."""
+    import pandas as pd
+
+    df["fid"] = df["fid"].astype("string")
+    df["role"] = df["role"].astype("string")
+    df["element_type"] = df["element_type"].astype("string")
+    df["period_idx"] = df["period_idx"].astype("int32")
+    df["period_seconds"] = df["period_seconds"].astype("int32")
+    for col in (*_NODE_METRICS_PARQUET, *_LINK_METRICS_PARQUET):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
+    # Final column order — matches `_parquet_schema_columns()`.
+    cols = _parquet_schema_columns()
+    return df.reindex(columns=cols)
+
+
+# ---------------------------------------------------------------------------
 # .out → results.zarr
 # ---------------------------------------------------------------------------
 
