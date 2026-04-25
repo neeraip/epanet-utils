@@ -34,6 +34,14 @@ from .rpt_decoder import EpanetReportDecoder
 from .rpt import EpanetReport
 from .out_decoder import EpanetOutputDecoder
 from .out import EpanetOutput
+from .exports import (
+    decode_to_data_json,
+    encode_with_overlay,
+    emit_report_json,
+    emit_results_zarr,
+    SPATIAL_SECTIONS,
+    NON_SPATIAL_SECTIONS,
+)
 
 __all__ = [
     # Input file handling
@@ -46,6 +54,13 @@ __all__ = [
     # Binary output file handling
     "EpanetOutputDecoder",
     "EpanetOutput",
+    # Producer-side exports (Console / WRM API)
+    "decode_to_data_json",
+    "encode_with_overlay",
+    "emit_report_json",
+    "emit_results_zarr",
+    "SPATIAL_SECTIONS",
+    "NON_SPATIAL_SECTIONS",
     # Version
     "__version__",
 ]
