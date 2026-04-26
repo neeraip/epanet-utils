@@ -381,11 +381,21 @@ class EpanetInputDecoder:
         pending_curve_type: Optional[str] = None
         # Map of curve_id -> type (filled while iterating).
         curve_types: Dict[str, str] = {}
+        # Standalone ``;<text>`` lines preceding a data row become that
+        # row's ``description``. Multiple consecutive ``;`` lines are
+        # joined with newlines. A blank line clears any pending text.
+        pending_desc: List[str] = []
+        # Parallel descriptions list for post-aggregation attach on
+        # PATTERNS / CURVES (where the result shape is a dict, not a
+        # list) — there we drop them since dict-keyed sections don't
+        # have per-row semantics matching positional descriptions.
+        descriptions: List[str] = []
 
         for line in content.split('\n'):
             stripped = line.strip()
 
             if not stripped:
+                pending_desc = []
                 continue
 
             # Curve type lives in comments — sniff before the comment-strip pass.
@@ -394,15 +404,20 @@ class EpanetInputDecoder:
                              stripped, re.IGNORECASE)
                 if m:
                     pending_curve_type = m.group(1).upper()
-                continue
+                    continue
 
-            # Skip other comments
+            # Standalone ``;<text>`` description line (excluding the
+            # double-semicolon ``;;`` column-header divider rows).
             if stripped.startswith(';'):
+                if not stripped.startswith(';;'):
+                    pending_desc.append(stripped[1:].strip())
                 continue
 
             line = stripped
+            inline_desc = ""
 
-            # Remove trailing semicolon and inline comments
+            # Remove trailing semicolon and capture inline comment as
+            # the row's inline description.
             if line.endswith(';'):
                 line = line[:-1].strip()
             if ';' in line:
@@ -413,10 +428,18 @@ class EpanetInputDecoder:
                         if char == '"':
                             in_quote = not in_quote
                         elif char == ';' and not in_quote:
+                            inline_desc = line[i + 1:].strip()
                             line = line[:i].strip()
                             break
                 else:
-                    line = line[:line.index(';')].strip()
+                    idx = line.index(';')
+                    inline_desc = line[idx + 1:].strip()
+                    line = line[:idx].strip()
+
+            # Preceding ``;`` lines win over inline comments (the more
+            # deliberate of the two when both are present).
+            row_desc = "\n".join(pending_desc) if pending_desc else inline_desc
+            pending_desc = []
 
             # Parse based on section type
             if section_name == "PATTERNS":
@@ -433,7 +456,10 @@ class EpanetInputDecoder:
                 row = self._parse_table_line(line, columns)
 
             if row:
+                if row_desc and isinstance(row, dict):
+                    row["description"] = row_desc
                 result.append(row)
+                descriptions.append(row_desc)
 
         # Aggregate patterns and curves into dict[id -> ...] shape.
         if section_name == "PATTERNS":

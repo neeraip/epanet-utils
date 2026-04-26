@@ -283,35 +283,43 @@ class EpanetInputEncoder:
     def _encode_table_section(self, data: List[Dict[str, Any]], section: str) -> str:
         """Encode a tabular section."""
         lines = []
-        
+
         # Add header comment
         if section in self.SECTION_HEADERS:
             lines.append(self.SECTION_HEADERS[section])
-        
+
         columns = self.SECTION_COLUMNS.get(section, [])
-        
+
         for row in data:
+            # Per-row description round-trips as a leading ``;<text>``
+            # line (one per physical line so multi-line descriptions
+            # stay readable). The EPANET engine ignores comments.
+            desc = row.get("description")
+            if desc:
+                for d_line in str(desc).split("\n"):
+                    lines.append(f";{d_line}")
+
             row_values = []
             for col in columns:
                 value = row.get(col, "")
                 if value is None:
                     value = ""
-                
+
                 # Format labels with quotes
                 if section == "labels" and col == "label":
                     value = f'"{value}"'
-                
+
                 row_values.append(str(value))
-            
+
             # Format row with tabs
             line = " " + "\t".join(f"{v:<16}" if i == 0 else f"{v:<12}" for i, v in enumerate(row_values))
-            
+
             # Add semicolon for most table sections
             if section not in ("labels", "backdrop"):
                 line = line.rstrip() + "\t;"
-            
+
             lines.append(line)
-        
+
         return '\n'.join(lines)
     
     def _encode_patterns_section(self, data: Any) -> str:
