@@ -229,25 +229,55 @@ class EpanetInputEncoder:
         return data
     
     def _encode_keyvalue_section(self, data: Dict[str, Any], section: str) -> str:
-        """Encode a key-value section."""
+        """Encode a key-value section.
+
+        Inverse of decoder. Two-token keys (``order_wall``,
+        ``global_price``) emit as two whitespace-separated tokens. The
+        accumulator lists ``pump_settings`` (ENERGY) and ``per_id``
+        (REACTIONS) emit one row per entry.
+        """
         lines = []
-        
+
         for key, value in data.items():
-            if key == "specific" and isinstance(value, list):
-                # Handle specific reaction coefficients
+            if value is None:
+                continue
+
+            if key == "pump_settings" and isinstance(value, list):
+                for s in value:
+                    if isinstance(s, dict):
+                        lines.append(
+                            f" Pump\t{s.get('id', '')}\t"
+                            f"{str(s.get('param', '')).capitalize()}\t{s.get('value', '')}"
+                        )
+                    else:
+                        # Legacy str payload from older decoders.
+                        lines.append(f" Pump \t{s}")
+                continue
+
+            if key == "per_id" and isinstance(value, list):
                 for item in value:
-                    lines.append(f" {item['type'].capitalize()}\t{item['value']}")
-            elif key == "pump_settings" and isinstance(value, list):
-                # Handle pump energy settings
-                for setting in value:
-                    lines.append(f" Pump \t{setting}")
-            else:
-                # Convert snake_case to Title Case
-                display_key = ' '.join(word.capitalize() for word in key.split('_'))
-                
-                if value is not None:
-                    lines.append(f" {display_key}\t{value}")
-        
+                    if not isinstance(item, dict):
+                        continue
+                    lines.append(
+                        f" {str(item.get('type', '')).capitalize()}\t"
+                        f"{item.get('id', '')}\t{item.get('value', '')}"
+                    )
+                continue
+
+            if key == "specific" and isinstance(value, list):
+                # Legacy shape from older decoders — keep emitting it
+                # so existing data.json blobs round-trip.
+                for item in value:
+                    lines.append(
+                        f" {item['type'].capitalize()}\t{item['value']}"
+                    )
+                continue
+
+            # Convert snake_case to Title Case (two-token keys split
+            # on underscore; one-token keys remain one word).
+            display_key = ' '.join(word.capitalize() for word in key.split('_'))
+            lines.append(f" {display_key}\t{value}")
+
         return '\n'.join(lines)
     
     def _encode_table_section(self, data: List[Dict[str, Any]], section: str) -> str:
@@ -284,38 +314,71 @@ class EpanetInputEncoder:
         
         return '\n'.join(lines)
     
-    def _encode_patterns_section(self, data: List[Dict[str, Any]]) -> str:
-        """Encode the PATTERNS section."""
+    def _encode_patterns_section(self, data: Any) -> str:
+        """Encode the PATTERNS section.
+
+        Accepts either the modern dict shape ``{id: [multipliers]}`` or
+        the legacy list shape ``[{id, multipliers}]``. Existing
+        data.json blobs in S3 may use either.
+        """
         lines = []
         lines.append(self.SECTION_HEADERS.get("patterns", ";ID              \tMultipliers"))
-        
-        for pattern in data:
-            pid = pattern.get("id", "")
-            multipliers = pattern.get("multipliers", [])
-            
-            # Split multipliers into rows of 6
+
+        items = self._patterns_items(data)
+        for pid, multipliers in items:
             for i in range(0, len(multipliers), 6):
                 chunk = multipliers[i:i+6]
                 values = "\t".join(f"{v:<12}" for v in chunk)
                 lines.append(f" {pid:<16}\t{values}")
-        
+
         return '\n'.join(lines)
-    
-    def _encode_curves_section(self, data: List[Dict[str, Any]]) -> str:
-        """Encode the CURVES section."""
+
+    def _encode_curves_section(self, data: Any) -> str:
+        """Encode the CURVES section.
+
+        Accepts dict shape ``{id: {type?, points: [{x,y}]}}`` (modern)
+        or list shape ``[{id, points}]`` (legacy). A leading
+        ``;PUMP:`` / ``;EFFICIENCY:`` etc. comment is emitted so the
+        type round-trips through EPANET — the engine itself ignores
+        these comments but the .inp viewer convention depends on them.
+        """
         lines = []
         lines.append(self.SECTION_HEADERS.get("curves", ";ID              \tX-Value     \tY-Value"))
-        
-        for curve in data:
-            cid = curve.get("id", "")
-            points = curve.get("points", [])
-            
-            for point in points:
+
+        for cid, curve in self._curves_items(data):
+            ctype = (curve.get("type") or "").upper()
+            if ctype:
+                lines.append(f";{ctype}: Curve {cid}")
+            for point in curve.get("points", []):
                 x = point.get("x", 0)
                 y = point.get("y", 0)
                 lines.append(f" {cid:<16}\t{x:<12}\t{y:<12}")
-        
+
         return '\n'.join(lines)
+
+    @staticmethod
+    def _patterns_items(data: Any):
+        """Yield (id, multipliers) regardless of dict or list shape."""
+        if isinstance(data, dict):
+            for pid, value in data.items():
+                if isinstance(value, list):
+                    yield pid, value
+                elif isinstance(value, dict):
+                    yield pid, value.get("multipliers", [])
+        elif isinstance(data, list):
+            for p in data:
+                yield p.get("id", ""), p.get("multipliers", [])
+
+    @staticmethod
+    def _curves_items(data: Any):
+        """Yield (id, curve_dict) regardless of dict or list shape."""
+        if isinstance(data, dict):
+            for cid, curve in data.items():
+                if isinstance(curve, dict):
+                    yield cid, curve
+        elif isinstance(data, list):
+            for c in data:
+                yield c.get("id", ""), c
     
     def _encode_single_parquet(self, model: Dict[str, Any], filepath: Path) -> None:
         """Encode to a single Parquet file."""

@@ -186,36 +186,50 @@ class EpanetInputDecoder:
     def decode_inp_string(self, content: str) -> Dict[str, Any]:
         """
         Decode EPANET input file content from a string.
-        
+
         Args:
             content: String content of .inp file
-            
+
         Returns:
             Dictionary containing parsed model data
         """
-        model = {"metadata": {"format": "epanet_inp", "version": "2.2"}}
-        
+        model = {
+            "metadata": {
+                "format": "epanet_inp",
+                "engine": "epanet",
+                "version": "2.2",
+            }
+        }
+
         # Split content into sections
         sections = self._split_sections(content)
-        
+
         # Parse each section
         for section_name, section_content in sections.items():
             section_upper = section_name.upper()
-            
+
+            # [END] is just the trailing marker — no payload to capture.
+            if section_upper == "END":
+                continue
+
             if section_upper in self.TEXT_SECTIONS:
                 model[section_name.lower()] = self._parse_text_section(section_content)
             elif section_upper in self.KEYVALUE_SECTIONS:
                 model[section_name.lower()] = self._parse_keyvalue_section(section_content, section_upper)
             elif section_upper in self.SECTION_COLUMNS:
                 model[section_name.lower()] = self._parse_table_section(
-                    section_content, 
+                    section_content,
                     self.SECTION_COLUMNS[section_upper],
                     section_upper
                 )
             else:
-                # Unknown section - store as text
-                model[section_name.lower()] = self._parse_text_section(section_content)
-        
+                # Unknown section — store under metadata.unknown_sections so
+                # it round-trips even though we don't understand its shape.
+                # (Matters for forward-compat when EPANET adds new sections.)
+                model.setdefault("metadata", {}).setdefault(
+                    "unknown_sections", {}
+                )[section_name] = section_content
+
         return model
     
     def _split_sections(self, content: str) -> Dict[str, str]:
@@ -253,64 +267,147 @@ class EpanetInputDecoder:
         return '\n'.join(lines)
     
     def _parse_keyvalue_section(self, content: str, section_name: str) -> Dict[str, Any]:
-        """Parse a key-value section (OPTIONS, TIMES, etc.)."""
-        result = {}
-        
+        """Parse a key-value section (OPTIONS, TIMES, ENERGY, REACTIONS, ...).
+
+        Most EPANET keyvalue sections use a one-token key + one value.
+        ENERGY and REACTIONS, however, use two-token keys:
+
+          [ENERGY]      GLOBAL PRICE 0.0     |  PUMP EFFIC <id> <curve>
+          [REACTIONS]   ORDER BULK 1         |  GLOBAL WALL 0.0
+                        ROUGHNESS CORRELATION 0.0
+
+        Naively splitting on the first whitespace collapses every
+        ``ORDER X 1`` line into a single ``order`` key, losing
+        BULK/WALL/TANK distinctions. We special-case those sections so
+        the second token is folded into the key (``order_wall``,
+        ``global_price``, …), giving the editor stable, lookupable keys.
+
+        Per-id pump rows in ENERGY (``PUMP <id> EFFIC <curve>``) and
+        per-id reactions in REACTIONS (``BULK <pipe-id> 0.5``) are
+        accumulated under a generic ``per_id`` list so they're not lost.
+        """
+        # Words that are themselves two-token *modifiers* — when we see
+        # them as the first token, the *next* token is a sub-keyword.
+        TWO_TOKEN_PREFIXES = {
+            "ENERGY": {"global", "demand", "pump"},
+            "REACTIONS": {"order", "global", "bulk", "wall", "tank",
+                          "limiting", "roughness"},
+        }
+
+        result: Dict[str, Any] = {}
+
         for line in content.split('\n'):
             line = line.strip()
-            
-            # Skip empty lines and comments
+
+            # Skip empty lines and full-line comments
             if not line or line.startswith(';'):
                 continue
-            
-            # Remove inline comments
+
+            # Strip inline comments
             if ';' in line:
                 line = line[:line.index(';')].strip()
-            
-            # Split into key and value
-            parts = line.split(None, 1)
-            if len(parts) >= 1:
-                key = parts[0].lower()
-                value = parts[1].strip() if len(parts) > 1 else ""
-                
-                # Try to convert numeric values
-                value = self._convert_value(value)
-                
-                # Handle special cases for ENERGY section (Pump efficiency curves)
-                if section_name == "ENERGY" and key == "pump":
-                    if "pump_settings" not in result:
-                        result["pump_settings"] = []
-                    result["pump_settings"].append(value)
-                elif section_name == "REACTIONS" and key in ("bulk", "wall", "tank"):
-                    # Handle pipe/tank specific reaction coefficients
-                    if "specific" not in result:
-                        result["specific"] = []
-                    result["specific"].append({"type": key, "value": value})
-                else:
-                    # Convert key to snake_case
-                    key = key.replace(' ', '_').replace('-', '_')
-                    result[key] = value
-        
+
+            parts = line.split()
+            if not parts:
+                continue
+
+            head = parts[0].lower()
+            two_token_set = TWO_TOKEN_PREFIXES.get(section_name, set())
+
+            # Special-case: PUMP <id> EFFIC <curve> / PUMP <id> PRICE <v>
+            # / PUMP <id> PATTERN <pat>. The pump id varies per row, so
+            # we collect them as a list of {id, param, value}.
+            if section_name == "ENERGY" and head == "pump" and len(parts) >= 4:
+                result.setdefault("pump_settings", []).append({
+                    "id": parts[1],
+                    "param": parts[2].lower(),
+                    "value": self._convert_value(" ".join(parts[3:])),
+                })
+                continue
+
+            # Special-case: REACTIONS per-pipe/tank — BULK <id> <coef> /
+            # WALL <id> <coef> / TANK <id> <coef> when the second token
+            # looks like an id rather than a known sub-keyword.
+            REACTIONS_GLOBAL_SUB = {"bulk", "wall", "tank"}
+            if (
+                section_name == "REACTIONS"
+                and head in REACTIONS_GLOBAL_SUB
+                and len(parts) >= 3
+                and parts[1].lower() not in {"bulk", "wall", "tank"}
+            ):
+                # Heuristic: numeric second token = per-id row
+                # (`Bulk Pipe1 0.5`); known sub-keyword = global row
+                # already handled below.
+                result.setdefault("per_id", []).append({
+                    "type": head,
+                    "id": parts[1],
+                    "value": self._convert_value(parts[2]),
+                })
+                continue
+
+            # Two-token key handling (`order_wall`, `global_price`, …).
+            if head in two_token_set and len(parts) >= 3:
+                key = f"{head}_{parts[1].lower()}"
+                value = self._convert_value(" ".join(parts[2:]))
+            else:
+                key = head.replace(' ', '_').replace('-', '_')
+                value = self._convert_value(parts[1]) if len(parts) > 1 else ""
+                if len(parts) > 2:
+                    # Preserve any trailing tokens as part of the value
+                    # (e.g. OPTIONS "MAP somefile.map" with whitespace).
+                    value = self._convert_value(" ".join(parts[1:]))
+
+            result[key] = value
+
         return result
     
-    def _parse_table_section(self, content: str, columns: List[str], section_name: str) -> List[Dict[str, Any]]:
-        """Parse a tabular section."""
-        result = []
-        
+    def _parse_table_section(self, content: str, columns: List[str], section_name: str) -> Any:
+        """Parse a tabular section.
+
+        For most sections this returns ``list[dict]``. PATTERNS and
+        CURVES are aggregated into ``dict[id -> ...]`` so the editor
+        can look them up by name (matches swmm-utils convention; also
+        avoids reconciling a list-of-dicts with a name-keyed editor).
+
+        CURVES additionally captures the type from the preceding
+        ``;PUMP:`` / ``;EFFICIENCY:`` / ``;VOLUME:`` / ``;HEADLOSS:``
+        comment line — EPANET stores the type only in those comments,
+        and losing them on import would force the user to re-classify
+        every curve.
+        """
+        result: List[Dict[str, Any]] = []
+        # Track the most recently seen curve type comment so it can
+        # attach to the next non-comment row in [CURVES].
+        pending_curve_type: Optional[str] = None
+        # Map of curve_id -> type (filled while iterating).
+        curve_types: Dict[str, str] = {}
+
         for line in content.split('\n'):
-            line = line.strip()
-            
-            # Skip empty lines and comments
-            if not line or line.startswith(';'):
+            stripped = line.strip()
+
+            if not stripped:
                 continue
-            
+
+            # Curve type lives in comments — sniff before the comment-strip pass.
+            if section_name == "CURVES" and stripped.startswith(';'):
+                m = re.match(r';\s*(PUMP|EFFICIENCY|VOLUME|HEADLOSS)\s*:',
+                             stripped, re.IGNORECASE)
+                if m:
+                    pending_curve_type = m.group(1).upper()
+                continue
+
+            # Skip other comments
+            if stripped.startswith(';'):
+                continue
+
+            line = stripped
+
             # Remove trailing semicolon and inline comments
             if line.endswith(';'):
                 line = line[:-1].strip()
             if ';' in line:
                 # Be careful with labels that might have semicolons in quoted strings
                 if '"' in line:
-                    # Find comment outside quotes
                     in_quote = False
                     for i, char in enumerate(line):
                         if char == '"':
@@ -320,28 +417,30 @@ class EpanetInputDecoder:
                             break
                 else:
                     line = line[:line.index(';')].strip()
-            
+
             # Parse based on section type
             if section_name == "PATTERNS":
                 row = self._parse_pattern_line(line, columns)
             elif section_name == "CURVES":
                 row = self._parse_curve_line(line, columns)
+                if row and pending_curve_type and row["id"] not in curve_types:
+                    curve_types[row["id"]] = pending_curve_type
             elif section_name == "LABELS":
                 row = self._parse_label_line(line, columns)
             elif section_name == "PUMPS":
                 row = self._parse_pump_line(line, columns)
             else:
                 row = self._parse_table_line(line, columns)
-            
+
             if row:
                 result.append(row)
-        
-        # Aggregate patterns and curves
+
+        # Aggregate patterns and curves into dict[id -> ...] shape.
         if section_name == "PATTERNS":
-            result = self._aggregate_patterns(result)
-        elif section_name == "CURVES":
-            result = self._aggregate_curves(result)
-        
+            return self._aggregate_patterns(result)
+        if section_name == "CURVES":
+            return self._aggregate_curves(result, curve_types)
+
         return result
     
     def _parse_table_line(self, line: str, columns: List[str]) -> Optional[Dict[str, Any]]:
@@ -427,28 +526,41 @@ class EpanetInputDecoder:
             "parameters": ' '.join(parts[3:])
         }
     
-    def _aggregate_patterns(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Aggregate pattern rows by ID."""
-        patterns = {}
+    def _aggregate_patterns(self, rows: List[Dict[str, Any]]) -> Dict[str, List[Any]]:
+        """Aggregate pattern rows into ``dict[id -> multipliers]``.
+
+        Multiple rows with the same id are concatenated (EPANET wraps
+        long patterns across many lines). The dict shape mirrors
+        swmm-utils' ``patterns: dict[name -> tokens]`` so a single
+        editor can render either engine's data.
+        """
+        patterns: Dict[str, List[Any]] = {}
         for row in rows:
             pid = row["id"]
-            if pid not in patterns:
-                patterns[pid] = {"id": pid, "multipliers": []}
-            patterns[pid]["multipliers"].extend(row["multipliers"])
-        return list(patterns.values())
-    
-    def _aggregate_curves(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Aggregate curve rows by ID."""
-        curves = {}
+            patterns.setdefault(pid, []).extend(row["multipliers"])
+        return patterns
+
+    def _aggregate_curves(
+        self,
+        rows: List[Dict[str, Any]],
+        curve_types: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Aggregate curve rows into ``dict[id -> {type, points}]``.
+
+        ``type`` comes from the ``;PUMP:`` / ``;EFFICIENCY:`` etc.
+        comment that precedes the data rows in standard EPANET output.
+        Curves without a type comment get type ``""`` so the editor can
+        prompt the user to classify them rather than guessing.
+        """
+        curve_types = curve_types or {}
+        curves: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             cid = row["id"]
-            if cid not in curves:
-                curves[cid] = {"id": cid, "points": []}
-            curves[cid]["points"].append({
-                "x": row["x_value"],
-                "y": row["y_value"]
-            })
-        return list(curves.values())
+            entry = curves.setdefault(
+                cid, {"type": curve_types.get(cid, ""), "points": []}
+            )
+            entry["points"].append({"x": row["x_value"], "y": row["y_value"]})
+        return curves
     
     def _convert_value(self, value: str) -> Any:
         """Convert a string value to appropriate type."""

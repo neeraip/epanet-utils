@@ -107,6 +107,338 @@ def decode_to_data_json(inp_path: PathLike) -> Dict[str, Any]:
     return data
 
 
+# ---------------------------------------------------------------------------
+# .inp → per-role GeoJSON layers
+# ---------------------------------------------------------------------------
+#
+# Canonical EPANET .inp → spatial-layer parser. Lifted from NEER's
+# lambda-importer (`app/inp_parser.py::_parse_epanet_inp`) so the lambda and
+# any other consumer (console seed, ad-hoc tooling) share one source of
+# truth instead of reimplementing per-element cross-references.
+#
+# Output is GeoJSON FeatureCollection dicts (no shapely / geopandas dep).
+# Callers who want a GeoDataFrame can do:
+#     gpd.GeoDataFrame.from_features(spec["feature_collection"]["features"],
+#                                    crs=spec["crs"])
+
+LAYER_ROLE_MAP: Dict[str, str] = {
+    "Junctions":  "junction",
+    "Reservoirs": "reservoir",
+    "Tanks":      "tank",
+    "Pipes":      "pipe",
+    "Pumps":      "pump",
+    "Valves":     "valve",
+}
+
+
+def _sf(val: Any) -> Optional[float]:
+    """Safe float conversion. Returns None if the value can't be coerced."""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _link_coords(
+    n1: str,
+    n2: str,
+    link_id: str,
+    coord_map: Dict[str, tuple],
+    vertex_map: Dict[str, list],
+) -> Optional[list]:
+    """LineString coordinates: start node → vertices in order → end node.
+
+    Returns None if either endpoint isn't in the coord map.
+    """
+    start = coord_map.get(n1)
+    end = coord_map.get(n2)
+    if not start or not end:
+        return None
+    coords: list = [[start[0], start[1]]]
+    for vx, vy in vertex_map.get(link_id, []):
+        coords.append([vx, vy])
+    coords.append([end[0], end[1]])
+    return coords
+
+
+def emit_geojson_layers(
+    inp_path: PathLike,
+    crs: Optional[str] = None,
+) -> list:
+    """Build one GeoJSON FeatureCollection per HydraulicModelRole.
+
+    Cross-references the per-element sibling sections that don't get
+    standalone editors in the console (tags, demands, status, quality,
+    sources, mixing, emitters) onto each feature's properties so the
+    attribute table reflects the full authored .inp.
+
+    EPANET pumps' opaque ``parameters`` blob is parsed into structured
+    columns (``param_head``, ``param_power``, ``param_speed``,
+    ``param_pattern``, ``param_price``, ``param_effic``) plus a
+    ``parameters_kind`` summary so consumers can branch on pump type
+    without reparsing the string.
+
+    Args:
+        inp_path: Path to a source .inp file.
+        crs: Optional CRS string stored in each layer spec for
+             downstream reprojection. Coordinate values themselves are
+             never transformed here.
+
+    Returns:
+        List of layer specs:
+            [
+              {
+                "name": "Junctions",
+                "role": "junction",
+                "geometry_type": "Point",
+                "crs": crs,
+                "feature_collection": {"type": "FeatureCollection", "features": [...]},
+              },
+              ...
+            ]
+
+        Empty roles are omitted.
+    """
+    from .inp import EpanetInput
+
+    inp = EpanetInput(inp_path)
+
+    coord_map: Dict[str, tuple] = {}
+    for c in inp.coordinates or []:
+        nid = str(c.get("node", c.get("id", "")))
+        if not nid:
+            continue
+        try:
+            coord_map[nid] = (float(c["x_coord"]), float(c["y_coord"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    vertex_map: Dict[str, list] = {}
+    for v in inp.vertices or []:
+        lid = str(v.get("link", v.get("id", "")))
+        if not lid:
+            continue
+        try:
+            vertex_map.setdefault(lid, []).append(
+                (float(v["x_coord"]), float(v["y_coord"]))
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    # --- Cross-reference lookups (sibling sections keyed by element id) ---
+    tag_by_id = {
+        str(t.get("name", t.get("id", ""))): str(t.get("tag", t.get("value", "")))
+        for t in (inp.tags or [])
+        if t.get("name") or t.get("id")
+    }
+    quality_by_id = {
+        str(q.get("node", q.get("id", ""))): _sf(
+            q.get("initial_quality", q.get("quality", q.get("init_qual")))
+        )
+        for q in (inp.quality or [])
+        if q.get("node") or q.get("id")
+    }
+    status_by_link = {
+        str(s.get("link", s.get("id", ""))): str(s.get("status", "")).upper() or None
+        for s in (inp.status or [])
+        if s.get("link") or s.get("id")
+    }
+    emitter_by_id = {
+        str(e.get("junction", e.get("id", ""))): _sf(e.get("coefficient"))
+        for e in (inp.emitters or [])
+        if e.get("junction") or e.get("id")
+    }
+    sources_by_id: Dict[str, Dict[str, Any]] = {}
+    for s in (inp.sources or []):
+        nid = str(s.get("node", s.get("id", "")))
+        if not nid:
+            continue
+        sources_by_id[nid] = {
+            "source_type": s.get("type"),
+            "source_quality": _sf(s.get("source_quality", s.get("quality"))),
+            "source_pattern": s.get("pattern"),
+        }
+    mixing_by_id: Dict[str, Dict[str, Any]] = {}
+    for m in (inp.mixing or []):
+        tid = str(m.get("tank", m.get("id", "")))
+        if not tid:
+            continue
+        mixing_by_id[tid] = {
+            "mixing_model": m.get("model"),
+            "mixing_fraction": _sf(m.get("fraction")),
+        }
+
+    demands_summary: Dict[str, Dict[str, Any]] = {}
+    for d in (inp.demands or []):
+        nid = str(d.get("junction", d.get("id", "")))
+        if not nid:
+            continue
+        bucket = demands_summary.setdefault(
+            nid, {"demand_count": 0, "total_base_demand": 0.0}
+        )
+        bucket["demand_count"] += 1
+        bd = _sf(d.get("base_demand", d.get("demand")))
+        if bd is not None:
+            bucket["total_base_demand"] += bd
+
+    def _enrich_node(row: Dict[str, Any], nid: str) -> Dict[str, Any]:
+        if nid in tag_by_id:
+            row["tag"] = tag_by_id[nid]
+        if nid in quality_by_id:
+            row["initial_quality"] = quality_by_id[nid]
+        if nid in demands_summary:
+            row.update(demands_summary[nid])
+        if nid in sources_by_id:
+            row.update(sources_by_id[nid])
+        if nid in emitter_by_id:
+            row["emitter_coefficient"] = emitter_by_id[nid]
+        return row
+
+    def _enrich_link(row: Dict[str, Any], lid: str) -> Dict[str, Any]:
+        if lid in tag_by_id:
+            row["tag"] = tag_by_id[lid]
+        if lid in status_by_link:
+            row["initial_status"] = status_by_link[lid]
+        return row
+
+    def _enrich_tank(row: Dict[str, Any], tid: str) -> Dict[str, Any]:
+        _enrich_node(row, tid)
+        if tid in mixing_by_id:
+            row.update(mixing_by_id[tid])
+        return row
+
+    layers: list = []
+
+    def _layer_spec(name: str, geom_type: str, features: list) -> Dict[str, Any]:
+        return {
+            "name": name,
+            "role": LAYER_ROLE_MAP[name],
+            "geometry_type": geom_type,
+            "crs": crs,
+            "feature_collection": {
+                "type": "FeatureCollection",
+                "features": features,
+            },
+        }
+
+    def _node_features(rows: Iterable[Dict[str, Any]], enrich) -> list:
+        out: list = []
+        for r in rows:
+            nid = str(r.get("id", ""))
+            xy = coord_map.get(nid)
+            if not xy:
+                continue
+            row = enrich({**r, "id": nid}, nid)
+            out.append(
+                {
+                    "type": "Feature",
+                    "id": nid,
+                    "properties": row,
+                    "geometry": {"type": "Point", "coordinates": [xy[0], xy[1]]},
+                }
+            )
+        return out
+
+    # --- Nodes ---
+    junctions = _node_features(inp.junctions, _enrich_node)
+    if junctions:
+        layers.append(_layer_spec("Junctions", "Point", junctions))
+
+    reservoirs = _node_features(inp.reservoirs, _enrich_node)
+    if reservoirs:
+        layers.append(_layer_spec("Reservoirs", "Point", reservoirs))
+
+    tanks = _node_features(inp.tanks, _enrich_tank)
+    if tanks:
+        layers.append(_layer_spec("Tanks", "Point", tanks))
+
+    # --- Pipes ---
+    pipe_feats: list = []
+    for p in inp.pipes:
+        pid = str(p.get("id", ""))
+        coords = _link_coords(
+            str(p.get("node1", "")), str(p.get("node2", "")),
+            pid, coord_map, vertex_map,
+        )
+        if not coords or len(coords) < 2:
+            continue
+        row = _enrich_link({**p, "id": pid}, pid)
+        pipe_feats.append(
+            {
+                "type": "Feature",
+                "id": pid,
+                "properties": row,
+                "geometry": {"type": "LineString", "coordinates": coords},
+            }
+        )
+    if pipe_feats:
+        layers.append(_layer_spec("Pipes", "LineString", pipe_feats))
+
+    # --- Pumps (with parameters-blob expansion) ---
+    pump_feats: list = []
+    recognized_pump_kw = {"HEAD", "POWER", "SPEED", "PATTERN", "PRICE", "EFFIC"}
+    for p in inp.pumps:
+        pid = str(p.get("id", ""))
+        coords = _link_coords(
+            str(p.get("node1", "")), str(p.get("node2", "")),
+            pid, coord_map, vertex_map,
+        )
+        if not coords or len(coords) < 2:
+            continue
+        row = _enrich_link({**p, "id": pid}, pid)
+        params = str(p.get("parameters", "") or "").strip()
+        if params:
+            tokens = params.split()
+            i = 0
+            kinds = []
+            while i < len(tokens):
+                kw = tokens[i].upper()
+                if kw in recognized_pump_kw and i + 1 < len(tokens):
+                    row[f"param_{kw.lower()}"] = tokens[i + 1]
+                    kinds.append(kw)
+                    i += 2
+                else:
+                    i += 1
+            if kinds:
+                row["parameters_kind"] = ",".join(kinds)
+        pump_feats.append(
+            {
+                "type": "Feature",
+                "id": pid,
+                "properties": row,
+                "geometry": {"type": "LineString", "coordinates": coords},
+            }
+        )
+    if pump_feats:
+        layers.append(_layer_spec("Pumps", "LineString", pump_feats))
+
+    # --- Valves ---
+    valve_feats: list = []
+    for v in inp.valves:
+        vid = str(v.get("id", ""))
+        coords = _link_coords(
+            str(v.get("node1", "")), str(v.get("node2", "")),
+            vid, coord_map, vertex_map,
+        )
+        if not coords or len(coords) < 2:
+            continue
+        row = _enrich_link({**v, "id": vid}, vid)
+        valve_feats.append(
+            {
+                "type": "Feature",
+                "id": vid,
+                "properties": row,
+                "geometry": {"type": "LineString", "coordinates": coords},
+            }
+        )
+    if valve_feats:
+        layers.append(_layer_spec("Valves", "LineString", valve_feats))
+
+    return layers
+
+
 def encode_with_overlay(
     source_inp_path: PathLike,
     data_overlay: Dict[str, Any],

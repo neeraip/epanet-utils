@@ -14,9 +14,11 @@ from pathlib import Path
 import pytest
 
 from epanet_utils.exports import (
+    LAYER_ROLE_MAP,
     NON_SPATIAL_SECTIONS,
     SPATIAL_SECTIONS,
     decode_to_data_json,
+    emit_geojson_layers,
     emit_report_json,
     emit_results_parquet,
     encode_with_overlay,
@@ -91,7 +93,11 @@ def test_encode_with_overlay_applies_edit(simple_inp):
         pytest.skip("fixture has no patterns to edit")
 
     sentinel = 9.99
-    data["patterns"][0]["multipliers"][0] = sentinel
+    # Patterns are a dict[id -> [multipliers]] (matches swmm-utils
+    # convention). Edit the first multiplier of whichever pattern the
+    # fixture happens to have first.
+    first_id = next(iter(data["patterns"]))
+    data["patterns"][first_id][0] = sentinel
     rendered = encode_with_overlay(simple_inp, data)
     assert f"{sentinel}" in rendered, "overlay edit did not appear in rendered .inp"
 
@@ -254,3 +260,59 @@ def test_emit_results_parquet_compression(ky5_files, tmp_path):
     # Every column in the first row group should be zstd.
     for i in range(rg.num_columns):
         assert rg.column(i).compression == "ZSTD"
+
+
+# ---------------------------------------------------------------------------
+# emit_geojson_layers
+# ---------------------------------------------------------------------------
+
+def test_emit_geojson_layers_shape(ky5_files):
+    """Each layer spec has the documented shape and nonzero feature counts.
+
+    simplenet.inp is too sparse for this — no JUNCTIONS / COORDINATES
+    rows, so it would emit zero layers. ky5.inp is the smallest real
+    fixture available with all six EPANET role classes.
+    """
+    inp, _, _ = ky5_files
+    layers = emit_geojson_layers(inp, crs="EPSG:4326")
+    assert len(layers) > 0
+
+    for spec in layers:
+        assert set(spec.keys()) == {
+            "name", "role", "geometry_type", "crs", "feature_collection",
+        }
+        assert spec["role"] == LAYER_ROLE_MAP[spec["name"]]
+        assert spec["crs"] == "EPSG:4326"
+        fc = spec["feature_collection"]
+        assert fc["type"] == "FeatureCollection"
+        assert len(fc["features"]) > 0
+        f0 = fc["features"][0]
+        assert f0["type"] == "Feature"
+        assert "id" in f0 and "properties" in f0 and "geometry" in f0
+        assert f0["geometry"]["type"] == spec["geometry_type"]
+
+
+def test_emit_geojson_layers_pump_parameters_expanded(ky5_files):
+    """Pumps' opaque ``parameters`` blob must expand into ``param_*`` keys
+    and a ``parameters_kind`` summary so consumers don't have to reparse."""
+    inp, _, _ = ky5_files
+    layers = emit_geojson_layers(inp)
+    pumps = next(
+        (s for s in layers if s["role"] == "pump"), None
+    )
+    if pumps is None:
+        pytest.skip("ky5 has no pumps to assert on")
+
+    feats = pumps["feature_collection"]["features"]
+    # ky5 uses POWER-style pumps; either form should expand. Assert that
+    # *some* pump produced at least one ``param_*`` key + a kind summary.
+    expanded = [
+        f for f in feats
+        if any(k.startswith("param_") for k in f["properties"])
+    ]
+    assert expanded, "expected at least one pump with expanded parameters"
+    p0 = expanded[0]["properties"]
+    assert "parameters_kind" in p0
+    assert p0["parameters_kind"] in ("HEAD", "POWER", "HEAD,SPEED", "POWER,SPEED") \
+        or "HEAD" in p0["parameters_kind"] \
+        or "POWER" in p0["parameters_kind"]
