@@ -107,7 +107,7 @@ class EpanetInputDecoder:
     SECTION_COLUMNS = {
         "JUNCTIONS": ["id", "elevation", "demand", "pattern"],
         "RESERVOIRS": ["id", "head", "pattern"],
-        "TANKS": ["id", "elevation", "init_level", "min_level", "max_level", "diameter", "min_vol", "vol_curve"],
+        "TANKS": ["id", "elevation", "init_level", "min_level", "max_level", "diameter", "min_vol", "vol_curve", "overflow"],
         "PIPES": ["id", "node1", "node2", "length", "diameter", "roughness", "minor_loss", "status"],
         "PUMPS": ["id", "node1", "node2", "parameters"],
         "VALVES": ["id", "node1", "node2", "diameter", "type", "setting", "minor_loss"],
@@ -288,10 +288,25 @@ class EpanetInputDecoder:
         """
         # Words that are themselves two-token *modifiers* — when we see
         # them as the first token, the *next* token is a sub-keyword.
+        # OPTIONS in EPANET 2.2 has several two-token keys: DEMAND
+        # MULTIPLIER, DEMAND MODEL, EMITTER EXPONENT, SPECIFIC GRAVITY,
+        # MINIMUM/REQUIRED/PRESSURE EXPONENT (PDA), plus QUALITY TRACE
+        # <node>. Without the merge here, "DEMAND MULTIPLIER 1.0" gets
+        # split into key=demand value="Multiplier 1.0", which lands in
+        # data.options as a broken pair that confuses the editor form.
         TWO_TOKEN_PREFIXES = {
             "ENERGY": {"global", "demand", "pump"},
             "REACTIONS": {"order", "global", "bulk", "wall", "tank",
                           "limiting", "roughness"},
+            "OPTIONS": {"demand", "emitter", "specific",
+                        "minimum", "required", "pressure"},
+            # Almost every TIMES key is two-token: HYDRAULIC TIMESTEP,
+            # QUALITY TIMESTEP, RULE TIMESTEP, PATTERN TIMESTEP/START,
+            # REPORT TIMESTEP/START, START CLOCKTIME. Without merging
+            # we'd drop the second token onto the value side and break
+            # both the editor schema and round-trip.
+            "TIMES": {"hydraulic", "quality", "rule", "pattern",
+                      "report", "start"},
         }
 
         result: Dict[str, Any] = {}
@@ -345,6 +360,36 @@ class EpanetInputDecoder:
                 })
                 continue
 
+            # Special-case: OPTIONS QUALITY — multi-token directive.
+            # Format:
+            #   QUALITY NONE
+            #   QUALITY AGE
+            #   QUALITY CHEMICAL <name> [mass-units]
+            #   QUALITY TRACE <node-id>
+            # EPANET also writes a stray ``QUALITY None mg/L`` (default
+            # mass units even when type is None). Split the value into
+            # the canonical schema keys so the editor's QUALITY_FIELDS
+            # form picks them up.
+            if section_name == "OPTIONS" and head == "quality" and len(parts) >= 2:
+                qtype = parts[1]
+                qtype_upper = qtype.upper()
+                result["quality"] = qtype
+                if qtype_upper == "CHEMICAL":
+                    if len(parts) >= 3:
+                        result["quality_chemical_name"] = parts[2]
+                    if len(parts) >= 4:
+                        result["mass_units"] = " ".join(parts[3:])
+                elif qtype_upper == "TRACE":
+                    if len(parts) >= 3:
+                        result["quality_trace_node"] = parts[2]
+                else:
+                    # NONE / AGE: any trailing tokens are mass-units
+                    # the EPANET writer leaves behind (harmless, but
+                    # we keep them so round-trip stays exact).
+                    if len(parts) >= 3:
+                        result["mass_units"] = " ".join(parts[2:])
+                continue
+
             # Two-token key handling (`order_wall`, `global_price`, …).
             if head in two_token_set and len(parts) >= 3:
                 key = f"{head}_{parts[1].lower()}"
@@ -377,10 +422,14 @@ class EpanetInputDecoder:
         """
         result: List[Dict[str, Any]] = []
         # Track the most recently seen curve type comment so it can
-        # attach to the next non-comment row in [CURVES].
+        # attach to the next non-comment row in [CURVES]. ``pending_*``
+        # lifecycle: set when a ``;PUMP:`` / ``;EFFICIENCY:`` etc. line
+        # is parsed, attached to the next data row, then cleared.
         pending_curve_type: Optional[str] = None
-        # Map of curve_id -> type (filled while iterating).
+        pending_curve_desc: Optional[str] = None
+        # Maps of curve_id → type / description (filled while iterating).
         curve_types: Dict[str, str] = {}
+        curve_descs: Dict[str, str] = {}
         # Standalone ``;<text>`` lines preceding a data row become that
         # row's ``description``. Multiple consecutive ``;`` lines are
         # joined with newlines. A blank line clears any pending text.
@@ -398,19 +447,45 @@ class EpanetInputDecoder:
                 pending_desc = []
                 continue
 
-            # Curve type lives in comments — sniff before the comment-strip pass.
+            # Curve type + description live in comments. EPANET writes
+            # rows like ``;PUMP: Pump curve for Pump VANTAGE_P1`` — the
+            # token before the ``:`` is the curve type, anything after
+            # is a free-form description for that curve. Sniff before
+            # the generic-comment-strip pass so the description doesn't
+            # get attached to a downstream data row instead.
             if section_name == "CURVES" and stripped.startswith(';'):
-                m = re.match(r';\s*(PUMP|EFFICIENCY|VOLUME|HEADLOSS)\s*:',
+                m = re.match(r';\s*(PUMP|EFFICIENCY|VOLUME|HEADLOSS)\s*:\s*(.*)',
                              stripped, re.IGNORECASE)
                 if m:
                     pending_curve_type = m.group(1).upper()
+                    pending_curve_desc = (m.group(2) or "").strip()
                     continue
 
             # Standalone ``;<text>`` description line (excluding the
             # double-semicolon ``;;`` column-header divider rows).
+            #
+            # Some legacy EPANET files use a single ``;`` for column
+            # headers (e.g. ``;ID\tElevation\tInitLevel``) instead of
+            # the modern ``;;`` convention. Without a guard here that
+            # header line gets stored as the first row's description
+            # ("ID\tElevation\t..." appears as the description for the
+            # first tank). Sniff: a ``;`` line with ≥3 TABs whose
+            # tab-separated tokens are short, single-word identifiers
+            # is almost certainly a column header — skip it.
             if stripped.startswith(';'):
-                if not stripped.startswith(';;'):
-                    pending_desc.append(stripped[1:].strip())
+                if stripped.startswith(';;'):
+                    continue
+                body = stripped[1:].strip()
+                tabs = body.count('\t')
+                if tabs >= 3:
+                    tokens = [t.strip() for t in body.split('\t') if t.strip()]
+                    if tokens and all(
+                        ' ' not in t and len(t) <= 24 and t.replace('_', '').replace('-', '').isalnum()
+                        for t in tokens
+                    ):
+                        # Column-header masquerading as a description — drop.
+                        continue
+                pending_desc.append(body)
                 continue
 
             line = stripped
@@ -446,8 +521,11 @@ class EpanetInputDecoder:
                 row = self._parse_pattern_line(line, columns)
             elif section_name == "CURVES":
                 row = self._parse_curve_line(line, columns)
-                if row and pending_curve_type and row["id"] not in curve_types:
-                    curve_types[row["id"]] = pending_curve_type
+                if row:
+                    if pending_curve_type and row["id"] not in curve_types:
+                        curve_types[row["id"]] = pending_curve_type
+                    if pending_curve_desc and row["id"] not in curve_descs:
+                        curve_descs[row["id"]] = pending_curve_desc
             elif section_name == "LABELS":
                 row = self._parse_label_line(line, columns)
             elif section_name == "PUMPS":
@@ -465,7 +543,7 @@ class EpanetInputDecoder:
         if section_name == "PATTERNS":
             return self._aggregate_patterns(result)
         if section_name == "CURVES":
-            return self._aggregate_curves(result, curve_types)
+            return self._aggregate_curves(result, curve_types, curve_descs)
 
         return result
     
@@ -570,15 +648,22 @@ class EpanetInputDecoder:
         self,
         rows: List[Dict[str, Any]],
         curve_types: Optional[Dict[str, str]] = None,
+        curve_descs: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Dict[str, Any]]:
-        """Aggregate curve rows into ``dict[id -> {type, points}]``.
+        """Aggregate curve rows into ``dict[id -> {type, points, description?}]``.
 
         ``type`` comes from the ``;PUMP:`` / ``;EFFICIENCY:`` etc.
         comment that precedes the data rows in standard EPANET output.
         Curves without a type comment get type ``""`` so the editor can
         prompt the user to classify them rather than guessing.
+
+        ``description`` is the free-form text after the type marker
+        on the same line (e.g. ``;PUMP: Pump curve for Pump VANTAGE_P1``
+        → ``"Pump curve for Pump VANTAGE_P1"``). Omitted when the
+        comment carries no description.
         """
         curve_types = curve_types or {}
+        curve_descs = curve_descs or {}
         curves: Dict[str, Dict[str, Any]] = {}
         for row in rows:
             cid = row["id"]
@@ -586,6 +671,8 @@ class EpanetInputDecoder:
                 cid, {"type": curve_types.get(cid, ""), "points": []}
             )
             entry["points"].append({"x": row["x_value"], "y": row["y_value"]})
+            if cid in curve_descs and "description" not in entry:
+                entry["description"] = curve_descs[cid]
         return curves
     
     def _convert_value(self, value: str) -> Any:

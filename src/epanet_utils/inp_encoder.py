@@ -79,7 +79,7 @@ class EpanetInputEncoder:
     SECTION_COLUMNS = {
         "junctions": ["id", "elevation", "demand", "pattern"],
         "reservoirs": ["id", "head", "pattern"],
-        "tanks": ["id", "elevation", "init_level", "min_level", "max_level", "diameter", "min_vol", "vol_curve"],
+        "tanks": ["id", "elevation", "init_level", "min_level", "max_level", "diameter", "min_vol", "vol_curve", "overflow"],
         "pipes": ["id", "node1", "node2", "length", "diameter", "roughness", "minor_loss", "status"],
         "pumps": ["id", "node1", "node2", "parameters"],
         "valves": ["id", "node1", "node2", "diameter", "type", "setting", "minor_loss"],
@@ -99,7 +99,7 @@ class EpanetInputEncoder:
     SECTION_HEADERS = {
         "junctions": ";ID              \tElev        \tDemand      \tPattern         ",
         "reservoirs": ";ID              \tHead        \tPattern         ",
-        "tanks": ";ID              \tElevation   \tInitLevel   \tMinLevel    \tMaxLevel    \tDiameter    \tMinVol      \tVolCurve",
+        "tanks": ";ID              \tElevation   \tInitLevel   \tMinLevel    \tMaxLevel    \tDiameter    \tMinVol      \tVolCurve        \tOverflow",
         "pipes": ";ID              \tNode1           \tNode2           \tLength      \tDiameter    \tRoughness   \tMinorLoss   \tStatus",
         "pumps": ";ID              \tNode1           \tNode2           \tParameters",
         "valves": ";ID              \tNode1           \tNode2           \tDiameter    \tType\tSetting     \tMinorLoss   ",

@@ -330,7 +330,11 @@ def emit_geojson_layers(
             xy = coord_map.get(nid)
             if not xy:
                 continue
-            row = enrich({**r, "id": nid}, nid)
+            # Store the canonical id under ``name`` (matches swmm-utils'
+            # convention) so the role-aware panels and the layer
+            # attribute table can read ``properties.name`` regardless
+            # of engine.
+            row = enrich({**r, "name": nid}, nid)
             out.append(
                 {
                     "type": "Feature",
@@ -364,7 +368,7 @@ def emit_geojson_layers(
         )
         if not coords or len(coords) < 2:
             continue
-        row = _enrich_link({**p, "id": pid}, pid)
+        row = _enrich_link({**p, "name": pid}, pid)
         pipe_feats.append(
             {
                 "type": "Feature",
@@ -387,7 +391,7 @@ def emit_geojson_layers(
         )
         if not coords or len(coords) < 2:
             continue
-        row = _enrich_link({**p, "id": pid}, pid)
+        row = _enrich_link({**p, "name": pid}, pid)
         params = str(p.get("parameters", "") or "").strip()
         if params:
             tokens = params.split()
@@ -424,7 +428,7 @@ def emit_geojson_layers(
         )
         if not coords or len(coords) < 2:
             continue
-        row = _enrich_link({**v, "id": vid}, vid)
+        row = _enrich_link({**v, "name": vid}, vid)
         valve_feats.append(
             {
                 "type": "Feature",
