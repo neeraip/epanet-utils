@@ -916,7 +916,15 @@ def emit_results_zarr(
 
 
 def _df_to_cube(df, id_col: str, ordered_ids: list, n_periods: int, metrics: Iterable[str]):
-    """Reshape a long-by-period DataFrame to (n_features, n_periods, n_metrics)."""
+    """
+    Reshape a long-by-period DataFrame to (n_features, n_periods, n_metrics).
+
+    Vectorized via numpy fancy-indexing: build a (feature_idx, period_idx)
+    pair per row, mask invalid rows, then scatter each metric column into
+    the cube in a single assignment. Replaces a per-row iterrows loop that
+    was O(rows * metrics) and dominated post-step time on real models
+    (e.g. ~50s per role for a 200-feature × 600-period network).
+    """
     import numpy as np
 
     metrics = list(metrics)
@@ -930,21 +938,24 @@ def _df_to_cube(df, id_col: str, ordered_ids: list, n_periods: int, metrics: Ite
     id_to_idx = {fid: i for i, fid in enumerate(ordered_ids)}
     period_col = "period" if "period" in df.columns else "time"
 
-    # Vectorize: pull arrays once; iterate row tuples.
-    available_metrics = [(j, m) for j, m in enumerate(metrics) if m in df.columns]
-    for _, row in df.iterrows():
-        i = id_to_idx.get(row[id_col])
-        if i is None:
+    feat_idx = df[id_col].map(id_to_idx).to_numpy()
+    period_idx = df[period_col].to_numpy()
+
+    valid = (
+        ~np.isnan(feat_idx.astype("float64", copy=False))
+        & (period_idx >= 0)
+        & (period_idx < n_periods)
+    )
+    if not valid.any():
+        return cube
+    fi = feat_idx[valid].astype("int64", copy=False)
+    pi = period_idx[valid].astype("int64", copy=False)
+
+    for j, name in enumerate(metrics):
+        if name not in df.columns:
             continue
-        p = int(row[period_col])
-        if p < 0 or p >= n_periods:
-            continue
-        for j, name in available_metrics:
-            v = row[name]
-            try:
-                cube[i, p, j] = float(v)
-            except (TypeError, ValueError):
-                continue
+        col_vals = df[name].to_numpy(dtype="float64", na_value=np.nan)[valid]
+        cube[fi, pi, j] = col_vals
     return cube
 
 
