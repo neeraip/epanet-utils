@@ -482,6 +482,31 @@ def encode_with_overlay(
 # .rpt → report.json
 # ---------------------------------------------------------------------------
 
+def _epanet_flatten_balances(
+    flow_balance: Optional[Dict[str, Any]],
+    quality_balance: Optional[Dict[str, Any]],
+) -> Dict[str, str]:
+    """Flatten EPANET flow / quality balances into a one-level
+    ``label -> display string`` map for the Console Results panel
+    (which renders ``balances`` as flat key/value rows).
+    """
+    out: Dict[str, str] = {}
+
+    def _emit(prefix: str, src: Optional[Dict[str, Any]]) -> None:
+        if not src:
+            return
+        for k, v in src.items():
+            if v is None or isinstance(v, (dict, list)):
+                continue
+            out[f"{prefix}.{k}"] = (
+                f"{v:g}" if isinstance(v, (int, float)) else str(v)
+            )
+
+    _emit("flow", flow_balance)
+    _emit("quality", quality_balance)
+    return out
+
+
 def emit_report_json(
     rpt_path: PathLike,
     out_path: Optional[PathLike] = None,
@@ -512,12 +537,18 @@ def emit_report_json(
             "flow_balance": report.flow_balance,
             "quality_balance": report.quality_balance,
             "energy": report.energy_usage,
-            "warnings": report.warnings,
-            "errors": report.errors,
+            "warnings": list(report.warnings),
+            "errors": list(report.errors),
             "status_log": report.hydraulic_status,
             "has_warnings": report.has_warnings(),
             "has_errors": report.has_errors(),
             "summary": report.summary(),
+            # Top-level normalized container the Console Results
+            # panel renders directly. flow_balance / quality_balance
+            # remain available above as engine-shape source of truth.
+            "balances": _epanet_flatten_balances(
+                report.flow_balance, report.quality_balance
+            ),
         }
 
     if out_path is not None:
