@@ -10,14 +10,11 @@ Supported output formats:
 """
 
 import json
-import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 try:
     import pandas as pd
-    import pyarrow as pa
-    import pyarrow.parquet as pq
     PANDAS_AVAILABLE = True
 except ImportError:
     PANDAS_AVAILABLE = False
@@ -26,18 +23,18 @@ except ImportError:
 class EpanetInputEncoder:
     """
     Encoder for EPANET input files.
-    
+
     Supports encoding to:
     - .inp files (native EPANET format)
     - .json files (JSON representation)
     - .parquet files (single or multi-file)
-    
+
     Example:
         >>> encoder = EpanetInputEncoder()
         >>> encoder.encode_to_inp_file(model_dict, "network.inp")
         >>> encoder.encode_to_json(model_dict, "network.json")
     """
-    
+
     # Sections in output order
     SECTION_ORDER = [
         "title",
@@ -68,13 +65,13 @@ class EpanetInputEncoder:
         "labels",
         "backdrop",
     ]
-    
+
     # Text sections
     TEXT_SECTIONS = {"title", "controls", "rules"}
-    
+
     # Key-value sections
     KEYVALUE_SECTIONS = {"energy", "reactions", "times", "report", "options", "backdrop"}
-    
+
     # Column order for tabular sections
     SECTION_COLUMNS = {
         "junctions": ["id", "elevation", "demand", "pattern"],
@@ -94,7 +91,7 @@ class EpanetInputEncoder:
         "vertices": ["link", "x_coord", "y_coord"],
         "labels": ["x_coord", "y_coord", "label", "anchor"],
     }
-    
+
     # Section headers with comments
     SECTION_HEADERS = {
         "junctions": ";ID              \tElev        \tDemand      \tPattern         ",
@@ -116,29 +113,29 @@ class EpanetInputEncoder:
         "vertices": ";Link            \tX-Coord         \tY-Coord",
         "labels": ";X-Coord           Y-Coord          Label & Anchor Node",
     }
-    
+
     def __init__(self):
         """Initialize the encoder."""
         pass
-    
+
     def encode_to_inp_string(self, model: Dict[str, Any]) -> str:
         """
         Encode model to EPANET .inp format string.
-        
+
         Args:
             model: Dictionary containing model data
-            
+
         Returns:
             String in EPANET .inp format
         """
         lines = []
-        
+
         for section in self.SECTION_ORDER:
             if section not in model:
                 continue
-            
+
             section_data = model[section]
-            
+
             # Skip empty sections
             if section_data is None:
                 continue
@@ -146,10 +143,10 @@ class EpanetInputEncoder:
                 continue
             if isinstance(section_data, str) and not section_data.strip():
                 continue
-            
+
             # Add section header
             lines.append(f"[{section.upper()}]")
-            
+
             # Encode section content
             if section in self.TEXT_SECTIONS:
                 lines.append(self._encode_text_section(section_data))
@@ -165,50 +162,50 @@ class EpanetInputEncoder:
                 # Unknown section - try as text
                 if isinstance(section_data, str):
                     lines.append(section_data)
-            
+
             lines.append("")  # Empty line between sections
-        
+
         # Add END marker
         lines.append("[END]")
         lines.append("")
-        
+
         return '\n'.join(lines)
-    
+
     def encode_to_inp_file(self, model: Dict[str, Any], filepath: Union[str, Path]) -> None:
         """
         Encode model to EPANET .inp file.
-        
+
         Args:
             model: Dictionary containing model data
             filepath: Output file path
         """
         filepath = Path(filepath)
         content = self.encode_to_inp_string(model)
-        
+
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
-    
+
     def encode_to_json(self, model: Dict[str, Any], filepath: Union[str, Path], pretty: bool = False) -> None:
         """
         Encode model to JSON file.
-        
+
         Args:
             model: Dictionary containing model data
             filepath: Output file path
             pretty: Whether to format JSON with indentation
         """
         filepath = Path(filepath)
-        
+
         with open(filepath, 'w', encoding='utf-8') as f:
             if pretty:
                 json.dump(model, f, indent=2)
             else:
                 json.dump(model, f)
-    
+
     def encode_to_parquet(self, model: Dict[str, Any], filepath: Union[str, Path], single_file: bool = False) -> None:
         """
         Encode model to Parquet format.
-        
+
         Args:
             model: Dictionary containing model data
             filepath: Output file path or directory
@@ -216,18 +213,18 @@ class EpanetInputEncoder:
         """
         if not PANDAS_AVAILABLE:
             raise ImportError("pandas and pyarrow are required for Parquet support")
-        
+
         filepath = Path(filepath)
-        
+
         if single_file:
             self._encode_single_parquet(model, filepath)
         else:
             self._encode_multi_parquet(model, filepath)
-    
+
     def _encode_text_section(self, data: str) -> str:
         """Encode a text section."""
         return data
-    
+
     def _encode_keyvalue_section(self, data: Dict[str, Any], section: str) -> str:
         """Encode a key-value section.
 
@@ -279,7 +276,7 @@ class EpanetInputEncoder:
             lines.append(f" {display_key}\t{value}")
 
         return '\n'.join(lines)
-    
+
     def _encode_table_section(self, data: List[Dict[str, Any]], section: str) -> str:
         """Encode a tabular section."""
         lines = []
@@ -321,7 +318,7 @@ class EpanetInputEncoder:
             lines.append(line)
 
         return '\n'.join(lines)
-    
+
     def _encode_patterns_section(self, data: Any) -> str:
         """Encode the PATTERNS section.
 
@@ -387,17 +384,17 @@ class EpanetInputEncoder:
         elif isinstance(data, list):
             for c in data:
                 yield c.get("id", ""), c
-    
+
     def _encode_single_parquet(self, model: Dict[str, Any], filepath: Path) -> None:
         """Encode to a single Parquet file."""
         all_rows = []
-        
+
         for section in self.SECTION_ORDER:
             if section not in model:
                 continue
-            
+
             section_data = model[section]
-            
+
             if section in self.TEXT_SECTIONS:
                 all_rows.append({"section": section, "content": section_data, "key": None, "value": None})
             elif section in self.KEYVALUE_SECTIONS:
@@ -408,26 +405,26 @@ class EpanetInputEncoder:
                     row_data = {"section": section, "content": None, "key": None, "value": None}
                     row_data.update(row)
                     all_rows.append(row_data)
-        
+
         df = pd.DataFrame(all_rows)
         df.to_parquet(filepath, index=False)
-    
+
     def _encode_multi_parquet(self, model: Dict[str, Any], dirpath: Path) -> None:
         """Encode to multiple Parquet files in a directory."""
         dirpath.mkdir(parents=True, exist_ok=True)
-        
+
         # Write metadata
         metadata = model.get("metadata", {})
         if metadata:
             df = pd.DataFrame([metadata])
             df.to_parquet(dirpath / "metadata.parquet", index=False)
-        
+
         for section in self.SECTION_ORDER:
             if section not in model:
                 continue
-            
+
             section_data = model[section]
-            
+
             if section in self.TEXT_SECTIONS:
                 df = pd.DataFrame([{"content": section_data}])
             elif section in self.KEYVALUE_SECTIONS:
@@ -436,5 +433,5 @@ class EpanetInputEncoder:
                 df = pd.DataFrame(section_data)
             else:
                 continue
-            
+
             df.to_parquet(dirpath / f"{section}.parquet", index=False)

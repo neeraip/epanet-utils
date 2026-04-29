@@ -10,15 +10,15 @@ system modeling files, including:
 
 Basic Usage:
     >>> from epanet_utils import EpanetInput, EpanetReport, EpanetOutput
-    >>> 
+    >>>
     >>> # Parse input file
     >>> with EpanetInput("model.inp") as model:
     ...     print(model.junctions)
-    >>> 
+    >>>
     >>> # Parse report file
     >>> with EpanetReport("simulation.rpt") as report:
     ...     print(report.flow_balance)
-    >>> 
+    >>>
     >>> # Parse binary output file
     >>> with EpanetOutput("simulation.out") as output:
     ...     print(f"Nodes: {output.num_nodes}")

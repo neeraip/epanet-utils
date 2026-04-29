@@ -671,7 +671,6 @@ def emit_results_parquet(
         Small descriptor dict: row count, column list, n_periods.
     """
     try:
-        import numpy as np
         import pandas as pd
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -687,8 +686,6 @@ def emit_results_parquet(
     with EpanetOutput(out_path) as ep:
         n_periods = ep.num_periods
         step = ep.report_time_step or 1
-        node_ids_all = list(ep.node_ids)
-        link_ids_all = list(ep.link_ids)
         nodes_df = ep.nodes_to_dataframe()
         links_df = ep.links_to_dataframe()
 
