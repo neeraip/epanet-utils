@@ -6,7 +6,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="epanet-utils",
-    version="0.1.0",
+    version="0.2.0",
     author="NEER",
     author_email="info@neer.ai",
     description="Utilities for interpreting EPA EPANET input (.inp) and report (.rpt) files",
