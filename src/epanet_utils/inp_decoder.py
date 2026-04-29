@@ -39,7 +39,6 @@ EPANET Input File Sections:
 """
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -54,18 +53,18 @@ except ImportError:
 class EpanetInputDecoder:
     """
     Decoder for EPANET input files.
-    
+
     Supports decoding from:
     - .inp files (native EPANET format)
     - .json files (JSON representation)
     - .parquet files (single or multi-file)
-    
+
     Example:
         >>> decoder = EpanetInputDecoder()
         >>> model = decoder.decode_file("network.inp")
         >>> print(model['junctions'])
     """
-    
+
     # All EPANET sections in standard order
     SECTIONS = [
         "TITLE",
@@ -96,13 +95,13 @@ class EpanetInputDecoder:
         "LABELS",
         "BACKDROP",
     ]
-    
+
     # Sections that are stored as text (not tabular)
     TEXT_SECTIONS = {"TITLE", "CONTROLS", "RULES"}
-    
+
     # Sections with key-value pairs
     KEYVALUE_SECTIONS = {"ENERGY", "REACTIONS", "TIMES", "REPORT", "OPTIONS", "BACKDROP"}
-    
+
     # Column definitions for tabular sections
     SECTION_COLUMNS = {
         "JUNCTIONS": ["id", "elevation", "demand", "pattern"],
@@ -124,36 +123,36 @@ class EpanetInputDecoder:
         "VERTICES": ["link", "x_coord", "y_coord"],
         "LABELS": ["x_coord", "y_coord", "label", "anchor"],
     }
-    
+
     def __init__(self):
         """Initialize the decoder."""
         pass
-    
+
     def decode_file(self, filepath: str) -> Dict[str, Any]:
         """
         Decode an EPANET input file.
-        
+
         Automatically detects format based on file extension.
-        
+
         Args:
             filepath: Path to input file (.inp, .json, or .parquet)
-            
+
         Returns:
             Dictionary containing parsed model data
-            
+
         Raises:
             ValueError: If file format is not supported
             FileNotFoundError: If file does not exist
         """
         filepath = Path(filepath)
-        
+
         if not filepath.exists():
             # Check if it's a parquet directory
             if not filepath.with_suffix('').exists():
                 raise FileNotFoundError(f"File not found: {filepath}")
-        
+
         ext = filepath.suffix.lower()
-        
+
         if ext == ".inp":
             return self.decode_inp(filepath)
         elif ext == ".json":
@@ -165,24 +164,24 @@ class EpanetInputDecoder:
             if filepath.is_dir() or (filepath.with_suffix('').exists() and filepath.with_suffix('').is_dir()):
                 return self.decode_parquet(filepath)
             raise ValueError(f"Unsupported file format: {ext}")
-    
+
     def decode_inp(self, filepath: Union[str, Path]) -> Dict[str, Any]:
         """
         Decode an EPANET .inp file.
-        
+
         Args:
             filepath: Path to .inp file
-            
+
         Returns:
             Dictionary containing parsed model data
         """
         filepath = Path(filepath)
-        
+
         with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
-        
+
         return self.decode_inp_string(content)
-    
+
     def decode_inp_string(self, content: str) -> Dict[str, Any]:
         """
         Decode EPANET input file content from a string.
@@ -231,13 +230,13 @@ class EpanetInputDecoder:
                 )[section_name] = section_content
 
         return model
-    
+
     def _split_sections(self, content: str) -> Dict[str, str]:
         """Split input file content into sections."""
         sections = {}
         current_section = None
         current_content = []
-        
+
         for line in content.split('\n'):
             # Check for section header
             match = re.match(r'\s*\[(\w+)\]\s*', line)
@@ -249,13 +248,13 @@ class EpanetInputDecoder:
                 current_content = []
             elif current_section:
                 current_content.append(line)
-        
+
         # Save last section
         if current_section:
             sections[current_section] = '\n'.join(current_content)
-        
+
         return sections
-    
+
     def _parse_text_section(self, content: str) -> str:
         """Parse a text section (TITLE, CONTROLS, RULES)."""
         lines = []
@@ -265,7 +264,7 @@ class EpanetInputDecoder:
             if stripped:
                 lines.append(stripped)
         return '\n'.join(lines)
-    
+
     def _parse_keyvalue_section(self, content: str, section_name: str) -> Dict[str, Any]:
         """Parse a key-value section (OPTIONS, TIMES, ENERGY, REACTIONS, ...).
 
@@ -294,7 +293,7 @@ class EpanetInputDecoder:
         # <node>. Without the merge here, "DEMAND MULTIPLIER 1.0" gets
         # split into key=demand value="Multiplier 1.0", which lands in
         # data.options as a broken pair that confuses the editor form.
-        TWO_TOKEN_PREFIXES = {
+        TWO_TOKEN_PREFIXES = {  # pylint: disable=invalid-name
             "ENERGY": {"global", "demand", "pump"},
             "REACTIONS": {"order", "global", "bulk", "wall", "tank",
                           "limiting", "roughness"},
@@ -343,7 +342,7 @@ class EpanetInputDecoder:
             # Special-case: REACTIONS per-pipe/tank — BULK <id> <coef> /
             # WALL <id> <coef> / TANK <id> <coef> when the second token
             # looks like an id rather than a known sub-keyword.
-            REACTIONS_GLOBAL_SUB = {"bulk", "wall", "tank"}
+            REACTIONS_GLOBAL_SUB = {"bulk", "wall", "tank"}  # pylint: disable=invalid-name
             if (
                 section_name == "REACTIONS"
                 and head in REACTIONS_GLOBAL_SUB
@@ -405,7 +404,7 @@ class EpanetInputDecoder:
             result[key] = value
 
         return result
-    
+
     def _parse_table_section(self, content: str, columns: List[str], section_name: str) -> Any:
         """Parse a tabular section.
 
@@ -546,52 +545,52 @@ class EpanetInputDecoder:
             return self._aggregate_curves(result, curve_types, curve_descs)
 
         return result
-    
+
     def _parse_table_line(self, line: str, columns: List[str]) -> Optional[Dict[str, Any]]:
         """Parse a single line of a table section."""
         parts = line.split()
         if not parts:
             return None
-        
+
         row = {}
         for i, col in enumerate(columns):
             if i < len(parts):
                 row[col] = self._convert_value(parts[i])
             else:
                 row[col] = None
-        
+
         return row
-    
+
     def _parse_pattern_line(self, line: str, columns: List[str]) -> Optional[Dict[str, Any]]:
         """Parse a PATTERNS section line."""
         parts = line.split()
         if not parts:
             return None
-        
+
         pattern_id = parts[0]
         multipliers = [self._convert_value(p) for p in parts[1:]]
-        
+
         return {"id": pattern_id, "multipliers": multipliers}
-    
+
     def _parse_curve_line(self, line: str, columns: List[str]) -> Optional[Dict[str, Any]]:
         """Parse a CURVES section line."""
         parts = line.split()
         if len(parts) < 3:
             return None
-        
+
         return {
             "id": parts[0],
             "x_value": self._convert_value(parts[1]),
             "y_value": self._convert_value(parts[2])
         }
-    
+
     def _parse_label_line(self, line: str, columns: List[str]) -> Optional[Dict[str, Any]]:
         """Parse a LABELS section line."""
         # Labels can have quoted strings
         parts = []
         current = ""
         in_quote = False
-        
+
         for char in line:
             if char == '"':
                 in_quote = not in_quote
@@ -601,35 +600,35 @@ class EpanetInputDecoder:
                     current = ""
             else:
                 current += char
-        
+
         if current:
             parts.append(current)
-        
+
         if len(parts) < 3:
             return None
-        
+
         row = {
             "x_coord": self._convert_value(parts[0]),
             "y_coord": self._convert_value(parts[1]),
             "label": parts[2].strip('"'),
             "anchor": parts[3] if len(parts) > 3 else None
         }
-        
+
         return row
-    
+
     def _parse_pump_line(self, line: str, columns: List[str]) -> Optional[Dict[str, Any]]:
         """Parse a PUMPS section line."""
         parts = line.split()
         if len(parts) < 4:
             return None
-        
+
         return {
             "id": parts[0],
             "node1": parts[1],
             "node2": parts[2],
             "parameters": ' '.join(parts[3:])
         }
-    
+
     def _aggregate_patterns(self, rows: List[Dict[str, Any]]) -> Dict[str, List[Any]]:
         """Aggregate pattern rows into ``dict[id -> multipliers]``.
 
@@ -674,57 +673,57 @@ class EpanetInputDecoder:
             if cid in curve_descs and "description" not in entry:
                 entry["description"] = curve_descs[cid]
         return curves
-    
+
     def _convert_value(self, value: str) -> Any:
         """Convert a string value to appropriate type."""
         if not value:
             return None
-        
+
         # Try integer
         try:
             return int(value)
         except ValueError:
             pass
-        
+
         # Try float
         try:
             return float(value)
         except ValueError:
             pass
-        
+
         # Return as string
         return value
-    
+
     def decode_json(self, filepath: Union[str, Path]) -> Dict[str, Any]:
         """
         Decode a JSON file.
-        
+
         Args:
             filepath: Path to JSON file
-            
+
         Returns:
             Dictionary containing model data
         """
         filepath = Path(filepath)
-        
+
         with open(filepath, 'r', encoding='utf-8') as f:
             return json.load(f)
-    
+
     def decode_parquet(self, filepath: Union[str, Path]) -> Dict[str, Any]:
         """
         Decode a Parquet file or directory.
-        
+
         Args:
             filepath: Path to .parquet file or directory containing .parquet files
-            
+
         Returns:
             Dictionary containing model data
         """
         if not PANDAS_AVAILABLE:
             raise ImportError("pandas and pyarrow are required for Parquet support")
-        
+
         filepath = Path(filepath)
-        
+
         # Check if it's a single file or directory
         if filepath.is_file():
             return self._decode_single_parquet(filepath)
@@ -736,17 +735,17 @@ class EpanetInputDecoder:
             if dir_path.is_dir():
                 return self._decode_multi_parquet(dir_path)
             raise FileNotFoundError(f"Parquet file or directory not found: {filepath}")
-    
+
     def _decode_single_parquet(self, filepath: Path) -> Dict[str, Any]:
         """Decode a single Parquet file with multiple tables."""
         import pyarrow.parquet as pq
-        
+
         model = {"metadata": {"format": "epanet_parquet", "version": "2.2"}}
-        
+
         # Read the parquet file
         table = pq.read_table(filepath)
         df = table.to_pandas()
-        
+
         # The single-file format stores section name in a column
         if 'section' in df.columns:
             for section_name in df['section'].unique():
@@ -756,23 +755,23 @@ class EpanetInputDecoder:
         else:
             # Assume it's metadata
             model.update(df.to_dict('records')[0] if len(df) > 0 else {})
-        
+
         return model
-    
+
     def _decode_multi_parquet(self, dirpath: Path) -> Dict[str, Any]:
         """Decode a directory of Parquet files."""
         model = {"metadata": {"format": "epanet_parquet", "version": "2.2"}}
-        
+
         for filepath in dirpath.glob("*.parquet"):
             section_name = filepath.stem.lower()
-            
+
             if section_name == "metadata":
                 df = pd.read_parquet(filepath)
                 if len(df) > 0:
                     model["metadata"].update(df.to_dict('records')[0])
             else:
                 df = pd.read_parquet(filepath)
-                
+
                 # Handle text sections
                 if section_name in [s.lower() for s in self.TEXT_SECTIONS]:
                     if 'content' in df.columns and len(df) > 0:
@@ -787,5 +786,5 @@ class EpanetInputDecoder:
                         model[section_name] = {}
                 else:
                     model[section_name] = df.to_dict('records')
-        
+
         return model
