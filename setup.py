@@ -38,5 +38,13 @@ setup(
             "pytest>=7.0.0",
             "pytest-cov>=4.0.0",
         ],
+        # Producer-side dependencies for emit_results_zarr (used by NEER
+        # Console / WRM API). Heavy; not pulled in for plain decode/encode.
+        "console": [
+            "xarray>=2024.1.0",
+            "zarr>=3.0.0",
+            "numcodecs>=0.13.0",
+            "numpy>=1.24",
+        ],
     },
 )
