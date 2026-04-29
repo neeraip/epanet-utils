@@ -11,6 +11,7 @@ disable=
     too-many-branches,               # Some parsing logic requires branching
     too-many-statements,             # Some methods are inherently complex
     too-many-arguments,              # Parsers/encoders take many parameters
+    too-many-positional-arguments,   # Same — newer pylint variant of the above
     too-many-instance-attributes,    # Decoder/encoder state is large
     too-many-nested-blocks,          # Parsing logic naturally nests
     too-many-return-statements,      # Section dispatch returns early often
