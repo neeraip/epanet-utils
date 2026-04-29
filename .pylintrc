@@ -1,0 +1,43 @@
+[MASTER]
+# Ignore these directories
+ignore-patterns=test_.*?py
+
+[MESSAGES CONTROL]
+# Disable warnings that are too strict for this codebase
+disable=
+    import-outside-toplevel,         # OK for optional dependencies
+    too-many-public-methods,         # Classes naturally have many methods
+    too-many-locals,                 # Some complex functions need variables
+    too-many-branches,               # Some parsing logic requires branching
+    too-many-statements,             # Some methods are inherently complex
+    too-many-arguments,              # Parsers/encoders take many parameters
+    too-many-instance-attributes,    # Decoder/encoder state is large
+    too-many-nested-blocks,          # Parsing logic naturally nests
+    too-many-return-statements,      # Section dispatch returns early often
+    too-few-public-methods,          # Not all classes need many methods
+    duplicate-code,                  # Acceptable for similar error handling
+    line-too-long,                   # Let black handle line length
+    too-many-boolean-expressions,    # Complex conditions are necessary
+    too-many-lines,                  # parser/exports modules are unavoidably large
+    no-self-use,                     # Methods grouped by section even when stateless
+    missing-module-docstring,        # Headers in code already explain modules
+    missing-class-docstring,         # Type names + section grouping document intent
+    missing-function-docstring,      # Internal helpers documented inline
+    no-else-return,                  # Stylistic; both forms are clear
+    unnecessary-pass,                # `...` and `pass` are interchangeable here
+    f-string-without-interpolation,  # Sometimes used for forward-compat formatting
+    broad-exception-caught,          # Best-effort decoder paths catch broadly on purpose
+    unused-argument,                 # Section-dispatch handlers share a uniform signature
+    wrong-import-position,           # examples/ scripts need sys.path setup before imports
+
+[FORMAT]
+# Line length
+max-line-length=100
+
+[BASIC]
+# Common short names used idiomatically in the parser / encoder /
+# dataframe code. Two-letter coordinate / math names (vx, vy, qx, ...)
+# are also allowed because spelling them out hurts readability.
+good-names=
+    df,f,m,p,e,v,i,j,k,n,x,y,z,_,fh,fp,fn,id,op,ts,dt,fd,ix,fid,
+    n1,n2,c1,c2,vx,vy,bd,xy,kw,ep,ds,fi,pi,xs,ys,qx,qy,qz,s,c,d,r,t,h
