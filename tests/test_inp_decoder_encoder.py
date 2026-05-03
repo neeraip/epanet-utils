@@ -247,6 +247,104 @@ Hydraulic Timestep   1:00
             parquet_files = list(Path(temp_dir).glob("*.parquet"))
             assert len(parquet_files) > 0
 
+    # ------------------------------------------------------------------
+    # OPTIONS QUALITY directive
+    # ------------------------------------------------------------------
+    # Regression suite for the bug where the encoder emitted
+    # ``Mass Units mg/L`` and ``Quality Chemical Name <name>`` as
+    # standalone [OPTIONS] lines. EPANET 2.3.3 rejects those with
+    # Error 202 ("illegal numeric value"); the only legal shape is the
+    # multi-token ``QUALITY <type> [<name>] [<units>]`` directive.
+
+    def test_quality_none_omits_mass_units_line(self, encoder):
+        """``quality=None`` + stray ``mass_units`` round-trips on the
+        QUALITY line, never as a standalone ``Mass Units`` line."""
+        out = encoder.encode_to_inp_string({
+            "options": {
+                "units": "GPM",
+                "quality": "None",
+                "mass_units": "mg/L",
+            }
+        })
+        assert "Mass Units" not in out, "encoder leaked Mass Units as a standalone OPTIONS key"
+        # Round-trip preserves the stray suffix on the QUALITY line.
+        assert "Quality\tNone\tmg/L" in out
+
+    def test_quality_none_without_mass_units(self, encoder):
+        """Cleanest case: no mass_units → bare ``Quality\tNone``."""
+        out = encoder.encode_to_inp_string({
+            "options": {"units": "GPM", "quality": "None"}
+        })
+        # Use splitlines to avoid the leading-whitespace alignment varying.
+        quality_lines = [ln.strip() for ln in out.splitlines() if ln.strip().startswith("Quality")]
+        assert quality_lines == ["Quality\tNone"]
+
+    def test_quality_chemical_with_name_and_units(self, encoder):
+        """Chemical: name + mass-units fold onto the QUALITY line."""
+        out = encoder.encode_to_inp_string({
+            "options": {
+                "quality": "Chemical",
+                "quality_chemical_name": "Free Chlorine",
+                "mass_units": "mg/L",
+            }
+        })
+        assert "Quality\tChemical\tFree Chlorine\tmg/L" in out
+        assert "Mass Units" not in out
+        assert "Quality Chemical Name" not in out
+
+    def test_quality_chemical_default_name_when_missing(self, encoder):
+        """Chemical without an explicit name falls back to ``Chemical``
+        — EPANET requires the name token, so emitting only the type
+        would be invalid."""
+        out = encoder.encode_to_inp_string({
+            "options": {"quality": "Chemical", "mass_units": "ug/L"},
+        })
+        assert "Quality\tChemical\tChemical\tug/L" in out
+
+    def test_quality_trace_emits_node(self, encoder):
+        """Trace: node id is the third token; mass_units is omitted
+        even if the dict carries one."""
+        out = encoder.encode_to_inp_string({
+            "options": {
+                "quality": "Trace",
+                "quality_trace_node": "N5",
+                "mass_units": "mg/L",
+            }
+        })
+        assert "Quality\tTrace\tN5" in out
+        assert "Mass Units" not in out
+
+    def test_quality_age_no_mass_units(self, encoder):
+        """Age has no extra tokens unless the decoder captured a
+        stray ``mass_units`` suffix to round-trip."""
+        out = encoder.encode_to_inp_string({
+            "options": {"quality": "Age"}
+        })
+        quality_lines = [ln.strip() for ln in out.splitlines() if ln.strip().startswith("Quality")]
+        assert quality_lines == ["Quality\tAge"]
+
+    def test_quality_options_roundtrip_chemical(self, encoder, decoder):
+        """End-to-end: decode a Chemical QUALITY directive, re-encode
+        it, and decode again — the dict shape is stable across one
+        full cycle."""
+        original = """[TITLE]
+Test
+[OPTIONS]
+ Units\tGPM
+ Quality\tChemical\tChlorine\tmg/L
+[END]
+"""
+        m1 = decoder.decode_inp_string(original)
+        assert m1["options"]["quality"] == "Chemical"
+        assert m1["options"]["quality_chemical_name"] == "Chlorine"
+        assert m1["options"]["mass_units"] == "mg/L"
+
+        encoded = encoder.encode_to_inp_string(m1)
+        m2 = decoder.decode_inp_string(encoded)
+        assert m2["options"]["quality"] == "Chemical"
+        assert m2["options"]["quality_chemical_name"] == "Chlorine"
+        assert m2["options"]["mass_units"] == "mg/L"
+
 
 class TestRoundTrip:
     """Test round-trip encoding/decoding."""
