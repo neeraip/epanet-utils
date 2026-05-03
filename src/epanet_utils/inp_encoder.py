@@ -225,6 +225,13 @@ class EpanetInputEncoder:
         """Encode a text section."""
         return data
 
+    # OPTIONS keys that are part of the multi-token QUALITY directive
+    # (see ``_encode_quality_option``) and so must NOT be emitted as
+    # standalone ``Mass Units …`` / ``Quality Chemical Name …`` lines —
+    # those aren't valid EPANET [OPTIONS] keys and the engine rejects
+    # the file with Error 202 (illegal numeric value).
+    _QUALITY_SUBKEYS = ("mass_units", "quality_chemical_name", "quality_trace_node")
+
     def _encode_keyvalue_section(self, data: Dict[str, Any], section: str) -> str:
         """Encode a key-value section.
 
@@ -270,12 +277,66 @@ class EpanetInputEncoder:
                     )
                 continue
 
+            # OPTIONS QUALITY is a multi-token directive
+            # (``QUALITY <type> [<chem-name>] [<mass-units>]`` for
+            # Chemical, ``QUALITY Trace <node>``, ``QUALITY Age``,
+            # ``QUALITY None``). The decoder splits it across several
+            # dict keys (``quality``, ``quality_chemical_name``,
+            # ``quality_trace_node``, ``mass_units``); the encoder has
+            # to fold them back into a single line. Emitting any of
+            # the sub-keys as its own line produces e.g. ``Mass Units
+            # mg/L`` which EPANET rejects with Error 202.
+            if section == "options" and key == "quality":
+                lines.append(self._encode_quality_option(value, data))
+                continue
+            if section == "options" and key in self._QUALITY_SUBKEYS:
+                continue
+
             # Convert snake_case to Title Case (two-token keys split
             # on underscore; one-token keys remain one word).
             display_key = ' '.join(word.capitalize() for word in key.split('_'))
             lines.append(f" {display_key}\t{value}")
 
         return '\n'.join(lines)
+
+    def _encode_quality_option(self, qtype: Any, options: Dict[str, Any]) -> str:
+        """Build the OPTIONS ``QUALITY`` line from the decoder's split
+        representation.
+
+        The decoder fans this directive out across several keys (see
+        ``inp_decoder.py``). This is the inverse: collect the relevant
+        sub-keys back onto one whitespace-separated line. EPANET only
+        accepts ``QUALITY`` as a multi-token directive, never as
+        separate ``Mass Units`` / ``Quality Chemical Name`` lines.
+        """
+        qtype_str = str(qtype) if qtype is not None else ""
+        qtype_upper = qtype_str.upper()
+        tokens = [qtype_str]
+
+        if qtype_upper == "CHEMICAL":
+            chem_name = options.get("quality_chemical_name")
+            # Engine requires a chemical name when type is Chemical;
+            # fall back to the type itself if the model didn't carry
+            # one (matches EPANET's own default behavior).
+            tokens.append(str(chem_name) if chem_name else "Chemical")
+            mass_units = options.get("mass_units")
+            if mass_units:
+                tokens.append(str(mass_units))
+        elif qtype_upper == "TRACE":
+            trace_node = options.get("quality_trace_node")
+            if trace_node:
+                tokens.append(str(trace_node))
+            # Mass units don't apply to Trace; intentionally omit.
+        else:
+            # NONE / AGE: round-trip a stray ``mass_units`` if the
+            # decoder captured one (EPANET's own writer occasionally
+            # emits ``QUALITY None mg/L``). Pure absence is the
+            # canonical case and the cleanest output.
+            mass_units = options.get("mass_units")
+            if mass_units:
+                tokens.append(str(mass_units))
+
+        return " Quality\t" + "\t".join(tokens)
 
     def _encode_table_section(self, data: List[Dict[str, Any]], section: str) -> str:
         """Encode a tabular section."""
