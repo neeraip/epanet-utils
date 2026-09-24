@@ -192,6 +192,29 @@ def test_emit_results_zarr_writes_and_reopens(ky5_files, tmp_path):
     assert len(ds.node_feature_id.values) == ds.nodes.shape[0]
 
 
+@pytest.mark.skipif(not _has_xarray_zarr(), reason="xarray + zarr not installed")
+def test_emit_results_zarr_chunks_by_period_for_the_map(ky5_files, tmp_path):
+    """A chunk spans every feature and as many periods as fit the byte target, so a map frame is one small object."""
+    from epanet_utils.exports import emit_results_zarr, _period_chunk
+    import zarr
+
+    inp, _, out = ky5_files
+    desc = emit_results_zarr(out, inp, str(tmp_path / "results.zarr"), target_chunk_bytes=64 * 1024)
+    g = zarr.open_group(str(tmp_path / "results.zarr"), mode="r")
+    for role, chunks in desc["chunks"].items():
+        arr = g[role]
+        assert list(arr.chunks) == list(chunks)
+        assert chunks[0] == arr.shape[0]
+        assert chunks[1] * chunks[0] * chunks[2] * 4 <= 64 * 1024 or chunks[1] == 1
+        assert chunks[2] == arr.shape[2]
+
+    pinned = emit_results_zarr(out, inp, str(tmp_path / "pinned.zarr"), chunk_periods=1)
+    assert all(c[1] == 1 for c in pinned["chunks"].values())
+    assert _period_chunk(4372, 1440, 5, None, 4 * 1024 * 1024) == 47
+    assert _period_chunk(10, 5, 3, None, 4 * 1024 * 1024) == 5
+    assert _period_chunk(10, 500, 3, 24, 4 * 1024 * 1024) == 24
+
+
 # ---------------------------------------------------------------------------
 # emit_results_parquet
 # ---------------------------------------------------------------------------

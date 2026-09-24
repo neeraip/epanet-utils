@@ -818,6 +818,8 @@ def emit_results_zarr(
     zarr_store: Any,
     *,
     chunk_features: int = 10_000,
+    chunk_periods: Optional[int] = None,
+    target_chunk_bytes: int = 4 * 1024 * 1024,
     sort_spatial: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -917,12 +919,22 @@ def emit_results_zarr(
         },
     )
 
+    # Chunking serves two readers. The map reads one period across every
+    # feature (a frame), so a chunk spans all features by default and only
+    # as many periods as fit `target_chunk_bytes` uncompressed, so a frame
+    # is one small object; a series reader (one feature, every period)
+    # fetches the period chunks and is cached server-side. `chunk_periods`
+    # pins the period chunk. Before this the cube was one chunk per role.
     n_node_chunk = min(chunk_features, max(1, len(node_ids)))
     n_link_chunk = min(chunk_features, max(1, len(link_ids)))
+    chunks_used = {
+        "nodes": (n_node_chunk, _period_chunk(n_node_chunk, n_periods, len(node_metrics), chunk_periods, target_chunk_bytes), len(node_metrics)),
+        "links": (n_link_chunk, _period_chunk(n_link_chunk, n_periods, len(link_metrics), chunk_periods, target_chunk_bytes), len(link_metrics)),
+    }
 
     encoding = {
-        "nodes": {"chunks": (n_node_chunk, n_periods, len(node_metrics))},
-        "links": {"chunks": (n_link_chunk, n_periods, len(link_metrics))},
+        "nodes": {"chunks": chunks_used["nodes"]},
+        "links": {"chunks": chunks_used["links"]},
     }
 
     # zarr_format defaults to whatever the installed zarr lib produces (v2 or
@@ -940,7 +952,20 @@ def emit_results_zarr(
         "n_periods": n_periods,
         "report_time_step_seconds": int(step),
         "chunk_features": chunk_features,
+        "chunks": {k: list(v) for k, v in chunks_used.items()},
     }
+
+
+def _period_chunk(
+    n_features_chunk: int, n_periods: int, n_metrics: int,
+    chunk_periods: Optional[int], target_chunk_bytes: int,
+) -> int:
+    """Periods per chunk: as given, else as many as fit the byte target (float32)."""
+    periods = max(1, int(n_periods))
+    if chunk_periods is not None:
+        return max(1, min(int(chunk_periods), periods))
+    per_period = max(1, n_features_chunk * max(1, n_metrics) * 4)
+    return max(1, min(periods, int(target_chunk_bytes) // per_period))
 
 
 def _df_to_cube(df, id_col: str, ordered_ids: list, n_periods: int, metrics: Iterable[str]):
