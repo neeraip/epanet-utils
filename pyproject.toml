@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "epanet-utils"
-version = "0.2.1"
+version = "0.3.0"
 description = "Utilities for interpreting EPA EPANET input (.inp) and report (.rpt) files"
 readme = "README.md"
 license = {text = "MIT"}
