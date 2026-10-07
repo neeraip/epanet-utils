@@ -585,23 +585,30 @@ _NON_METRIC_COLS = frozenset({"id", "period", "time", "node_index", "link_index"
 
 
 def _summarize_per_feature(df, id_col: str) -> Dict[str, Any]:
-    """min/max/mean per metric per feature; expects long-by-period DataFrame."""
+    """
+    min/max/mean per metric per feature; expects long-by-period DataFrame.
+
+    argmin / argmax are the period indices at which the min / max occur.
+    """
     metric_cols = [c for c in df.columns if c not in _NON_METRIC_COLS]
+    period_col = "period" if "period" in df.columns else None
     out: Dict[str, Any] = {}
     grouped = df.groupby(id_col)
     for fid, sub in grouped:
         per_metric: Dict[str, Any] = {}
+        periods = sub[period_col] if period_col else None
         for m in metric_cols:
             series = sub[m]
             try:
+                imin, imax = series.idxmin(), series.idxmax()
                 per_metric[m] = {
                     "min": float(series.min()),
                     "max": float(series.max()),
                     "mean": float(series.mean()),
-                    "argmin": int(series.idxmin()),
-                    "argmax": int(series.idxmax()),
+                    "argmin": int(periods.loc[imin] if periods is not None else imin),
+                    "argmax": int(periods.loc[imax] if periods is not None else imax),
                 }
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, KeyError):
                 # Non-numeric column (e.g. status flags); skip gracefully.
                 continue
         out[str(fid)] = per_metric

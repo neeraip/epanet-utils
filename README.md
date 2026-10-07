@@ -417,6 +417,14 @@ class EpanetOutput:
     num_periods: int               # Number of reporting periods
     node_ids: List[str]            # List of node IDs
     link_ids: List[str]            # List of link IDs
+    node_types: List[str]          # JUNCTION / RESERVOIR / TANK
+    node_elevations: List[float]   # Node elevations
+    link_types: List[str]          # PIPE / CVPIPE / PUMP / PRV / ...
+    link_lengths: List[float]      # Link lengths
+    link_diameters: List[float]    # Link diameters (0 for pumps)
+    link_start_node_ids: List[str] # Link start nodes
+    link_end_node_ids: List[str]   # Link end nodes
+    peak_demand_cost: float        # Energy demand charge
     title: str                     # Simulation title
     version: int                   # EPANET version
     report_time_step: int          # Report time step (seconds)
