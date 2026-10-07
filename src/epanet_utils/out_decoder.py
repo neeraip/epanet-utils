@@ -235,7 +235,7 @@ class EpanetOutputDecoder:
         prolog = {"valid": False}
 
         try:
-            header = self._read_ints(f, _PROLOG_INT_COUNT)
+            header = struct.unpack(f'<{_PROLOG_INT_COUNT}i', f.read(4 * _PROLOG_INT_COUNT))
             (magic, version, num_nodes, num_tanks, num_links, num_pumps,
              num_valves, quality_option, trace_node, flow_units,
              pressure_units, report_statistic, report_start, report_step,
