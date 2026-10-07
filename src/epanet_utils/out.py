@@ -143,6 +143,47 @@ class EpanetOutput:
         return self.prolog.get("link_ids", [])
 
     @property
+    def node_types(self) -> List[str]:
+        """Get node types (JUNCTION, RESERVOIR or TANK) in node order."""
+        return self.prolog.get("node_types", [])
+
+    @property
+    def node_elevations(self) -> List[float]:
+        """Get node elevations (ft or m) in node order."""
+        return self.prolog.get("node_elevations", [])
+
+    @property
+    def link_types(self) -> List[str]:
+        """Get link type names (PIPE, CVPIPE, PUMP, PRV, ...) in link order."""
+        return self.prolog.get("link_type_names", [])
+
+    @property
+    def link_lengths(self) -> List[float]:
+        """Get link lengths (ft or m) in link order."""
+        return self.prolog.get("link_lengths", [])
+
+    @property
+    def link_diameters(self) -> List[float]:
+        """Get link diameters (in or mm; 0 for pumps) in link order."""
+        return self.prolog.get("link_diameters", [])
+
+    @property
+    def link_start_node_ids(self) -> List[str]:
+        """Get each link's start node ID."""
+        return self.prolog.get("link_start_node_ids", [])
+
+    @property
+    def link_end_node_ids(self) -> List[str]:
+        """Get each link's end node ID."""
+        return self.prolog.get("link_end_node_ids", [])
+
+    @property
+    def peak_demand_cost(self) -> Optional[float]:
+        """Get the energy peak demand charge."""
+        self._ensure_loaded()
+        return self._output.get("peak_demand_cost")
+
+    @property
     def title(self) -> str:
         """Get simulation title."""
         return self.prolog.get("title", "")

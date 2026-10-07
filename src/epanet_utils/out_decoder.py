@@ -3,18 +3,40 @@ EPANET Binary Output File Decoder
 
 Decodes EPANET binary output files (.out) into Python dictionaries.
 
-The EPANET output file is a binary file with the following structure:
-1. Prolog - Header information and network counts
-2. Energy Usage - Pump energy consumption data
-3. Dynamic Results - Time series data for nodes and links
-4. Epilog - Summary statistics
+Layout (EPANET 2.2 / 2.3, written by ``src/output.c`` in OWA-EPANET; every
+integer is int32 and every real is float32, little-endian):
 
-Binary Format Reference:
-- All integers are 4-byte (int32)
-- All floats are 4-byte (float32)
-- Strings are fixed-length character arrays
+1. Prolog (``savenetdata``)
+   - 15 int32: magic, version, Nnodes, Ntanks (reservoirs + tanks), Nlinks,
+     Npumps, Nvalves, quality option, trace node, flow units, pressure
+     units, report statistic, report start, report step, duration
+   - title: 3 x 80 chars; input file: 260; report file: 260;
+     chemical name: 32; chemical units: 32
+   - node IDs: Nnodes x 32 chars; link IDs: Nlinks x 32 chars
+   - link start node indices, link end node indices, link types:
+     3 x Nlinks int32 (1-based node indices)
+   - tank node indices: Ntanks int32; tank cross-section areas: Ntanks float
+   - node elevations: Nnodes float; link lengths: Nlinks float;
+     link diameters: Nlinks float
+2. Energy usage (``saveenergy``)
+   - per pump: pump link index (int32, 1-based) + 6 floats (utilization %,
+     avg efficiency %, kWh per flow unit, avg kW, peak kW, avg cost/day)
+   - 1 float: peak demand cost
+3. Dynamic results (``saveoutput``), per reporting period:
+   - 4 x Nnodes floats (demand, head, pressure, quality)
+   - 8 x Nlinks floats (flow, velocity, headloss, avg quality, status,
+     setting, reaction rate, friction factor)
+4. Epilog (last 28 bytes): 4 floats (avg bulk, wall, tank reaction rates,
+   avg source inflow rate), int32 Nperiods, int32 warning flag, int32 magic.
+
+The period count comes from the epilog, and the dynamic results are located
+from the end of the file: ``filesize - 28 - Nperiods * (16*Nnodes + 32*Nlinks)``.
+
+Indices exposed by this decoder are 0-based (``node_index``/``link_index``
+into ``node_ids``/``link_ids``), unlike the 1-based values in the file.
 """
 
+import os
 import struct
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -26,15 +48,39 @@ except ImportError:
     PANDAS_AVAILABLE = False
 
 
+# EPANET LinkType enum (types.h). PCV is EPANET 2.3+.
+LINK_TYPE_NAMES = {
+    0: "CVPIPE",
+    1: "PIPE",
+    2: "PUMP",
+    3: "PRV",
+    4: "PSV",
+    5: "PBV",
+    6: "FCV",
+    7: "TCV",
+    8: "GPV",
+    9: "PCV",
+}
+
+_EPILOG_BYTES = 28
+_PROLOG_INT_COUNT = 15
+_ID_LEN = 32
+_TITLE_LEN = 80
+_FNAME_LEN = 260
+_NODE_VARS = 4
+_LINK_VARS = 8
+
+
 class EpanetOutputDecoder:
     """
     Decoder for EPANET binary output files (.out).
 
     Parses simulation output including:
-    - Network metadata (counts of nodes, links, etc.)
+    - Network metadata (counts, IDs, link end nodes and types, tank areas,
+      node elevations, link lengths and diameters)
     - Time series data for nodes (demand, head, pressure, quality)
-    - Time series data for links (flow, velocity, headloss, status)
-    - Energy usage statistics
+    - Time series data for links (flow, velocity, headloss, status, ...)
+    - Pump energy usage statistics
 
     Example:
         >>> decoder = EpanetOutputDecoder()
@@ -87,6 +133,7 @@ class EpanetOutputDecoder:
         output = {
             "prolog": {},
             "energy_usage": [],
+            "peak_demand_cost": None,
             "node_results": [],
             "link_results": [],
             "epilog": {},
@@ -96,6 +143,10 @@ class EpanetOutputDecoder:
             }
         }
 
+        f.seek(0, os.SEEK_END)
+        file_size = f.tell()
+        f.seek(0)
+
         # Read prolog
         prolog = self._read_prolog(f)
         output["prolog"] = prolog
@@ -103,39 +154,92 @@ class EpanetOutputDecoder:
         if not prolog.get("valid", False):
             return output
 
-        # Calculate offsets
-        num_nodes = prolog.get("num_nodes", 0)
-        num_links = prolog.get("num_links", 0)
-        num_pumps = prolog.get("num_pumps", 0)
-        num_periods = prolog.get("num_periods", 0)
+        num_nodes = prolog["num_nodes"]
+        num_links = prolog["num_links"]
+        num_pumps = prolog["num_pumps"]
 
-        # Read energy usage (one record per pump)
-        output["energy_usage"] = self._read_energy_usage(f, num_pumps)
+        # Read energy usage (one record per pump, then the peak demand cost)
+        energy, peak_demand_cost = self._read_energy_usage(f, num_pumps, prolog.get("link_ids", []))
+        output["energy_usage"] = energy
+        output["peak_demand_cost"] = peak_demand_cost
+        energy_end = f.tell()
+
+        # Read epilog from the end of the file
+        epilog = self._read_epilog(f, file_size)
+        output["epilog"] = epilog
+
+        period_bytes = 4 * (_NODE_VARS * num_nodes + _LINK_VARS * num_links)
+        num_periods_computed = prolog.get("num_periods_computed", 0)
+
+        if epilog.get("magic_number") == self.EPANET_MAGIC_NUMBER and epilog.get("num_periods", -1) >= 0:
+            num_periods = epilog["num_periods"]
+            results_offset = file_size - _EPILOG_BYTES - num_periods * period_bytes
+            if results_offset < energy_end:
+                # Epilog disagrees with the file size; fall back to sequential.
+                results_offset = energy_end
+                num_periods = self._periods_that_fit(file_size - _EPILOG_BYTES - energy_end, period_bytes)
+        else:
+            # No valid epilog (e.g. the run aborted): read the complete
+            # periods that follow the energy section.
+            results_offset = energy_end
+            num_periods = self._periods_that_fit(file_size - energy_end, period_bytes)
+            if num_periods_computed:
+                num_periods = min(num_periods, num_periods_computed)
+
+        prolog["num_periods"] = num_periods
+        prolog["results_offset"] = results_offset
 
         # Read dynamic results (time series)
         if load_time_series and num_periods > 0:
+            f.seek(results_offset)
             time_series = self._read_time_series(f, num_nodes, num_links, num_periods)
             output["time_series"] = time_series
 
             # Also populate summary results from final period
             if time_series["nodes"]:
-                output["node_results"] = time_series["nodes"][-1] if time_series["nodes"] else []
+                output["node_results"] = time_series["nodes"][-1]
             if time_series["links"]:
-                output["link_results"] = time_series["links"][-1] if time_series["links"] else []
-
-        # Read epilog
-        output["epilog"] = self._read_epilog(f)
+                output["link_results"] = time_series["links"][-1]
 
         return output
+
+    @staticmethod
+    def _periods_that_fit(nbytes: int, period_bytes: int) -> int:
+        if period_bytes <= 0 or nbytes <= 0:
+            return 0
+        return nbytes // period_bytes
+
+    @staticmethod
+    def _read_ints(f, n: int) -> List[int]:
+        if n <= 0:
+            return []
+        data = f.read(4 * n)
+        return list(struct.unpack(f'<{n}i', data))
+
+    @staticmethod
+    def _read_floats(f, n: int) -> List[float]:
+        if n <= 0:
+            return []
+        data = f.read(4 * n)
+        return list(struct.unpack(f'<{n}f', data))
+
+    @staticmethod
+    def _read_str(f, n: int) -> str:
+        raw = f.read(n)
+        if len(raw) < n:
+            raise IOError("unexpected end of file in prolog")
+        return raw.split(b'\x00', 1)[0].decode('ascii', errors='replace').strip()
 
     def _read_prolog(self, f) -> Dict[str, Any]:
         """Read the prolog section of the output file."""
         prolog = {"valid": False}
 
         try:
-            # Read magic number and version
-            magic = struct.unpack('i', f.read(4))[0]
-            version = struct.unpack('i', f.read(4))[0]
+            header = struct.unpack(f'<{_PROLOG_INT_COUNT}i', f.read(4 * _PROLOG_INT_COUNT))
+            (magic, version, num_nodes, num_tanks, num_links, num_pumps,
+             num_valves, quality_option, trace_node, flow_units,
+             pressure_units, report_statistic, report_start, report_step,
+             duration) = header
 
             prolog["magic_number"] = magic
             prolog["version"] = version
@@ -144,163 +248,162 @@ class EpanetOutputDecoder:
             if magic != self.EPANET_MAGIC_NUMBER:
                 return prolog
 
-            # Read network counts
-            prolog["num_nodes"] = struct.unpack('i', f.read(4))[0]
-            prolog["num_reservoirs_tanks"] = struct.unpack('i', f.read(4))[0]
-            prolog["num_links"] = struct.unpack('i', f.read(4))[0]
-            prolog["num_pumps"] = struct.unpack('i', f.read(4))[0]
-            prolog["num_valves"] = struct.unpack('i', f.read(4))[0]
+            # Network counts
+            prolog["num_nodes"] = num_nodes
+            prolog["num_reservoirs_tanks"] = num_tanks
+            prolog["num_links"] = num_links
+            prolog["num_pumps"] = num_pumps
+            prolog["num_valves"] = num_valves
 
-            # Read options
-            prolog["water_quality_option"] = struct.unpack('i', f.read(4))[0]
-            prolog["trace_node_index"] = struct.unpack('i', f.read(4))[0]
-            prolog["flow_units"] = struct.unpack('i', f.read(4))[0]
-            prolog["pressure_units"] = struct.unpack('i', f.read(4))[0]
+            # Options
+            prolog["water_quality_option"] = quality_option
+            prolog["trace_node_index"] = trace_node
+            prolog["flow_units"] = flow_units
+            prolog["pressure_units"] = pressure_units
 
-            # Read time parameters
-            prolog["report_statistic_type"] = struct.unpack('i', f.read(4))[0]
-            prolog["report_start_time"] = struct.unpack('i', f.read(4))[0]
-            prolog["report_time_step"] = struct.unpack('i', f.read(4))[0]
-            prolog["simulation_duration"] = struct.unpack('i', f.read(4))[0]
+            # Time parameters
+            prolog["report_statistic_type"] = report_statistic
+            prolog["report_start_time"] = report_start
+            prolog["report_time_step"] = report_step
+            prolog["simulation_duration"] = duration
 
-            # Calculate number of reporting periods
-            if prolog["report_time_step"] > 0:
-                prolog["num_periods"] = (prolog["simulation_duration"] - prolog["report_start_time"]) // prolog["report_time_step"] + 1
+            # Period count implied by the times. The decoder replaces
+            # num_periods with the epilog's count, which is authoritative.
+            if report_step > 0 and duration >= report_start:
+                computed = (duration - report_start) // report_step + 1
             else:
-                prolog["num_periods"] = 0
+                computed = 0
+            prolog["num_periods_computed"] = computed
+            prolog["num_periods"] = computed
 
-            # Read problem title (3 lines of 80 chars each)
-            title_lines = []
-            for _ in range(3):
-                title_data = f.read(80)
-                title_lines.append(title_data.decode('ascii', errors='replace').strip('\x00').strip())
+            # Title (3 lines), file names, chemical name and units
+            title_lines = [self._read_str(f, _TITLE_LEN) for _ in range(3)]
             prolog["title"] = '\n'.join(line for line in title_lines if line)
+            prolog["input_file"] = self._read_str(f, _FNAME_LEN)
+            prolog["report_file"] = self._read_str(f, _FNAME_LEN)
+            prolog["chemical_name"] = self._read_str(f, _ID_LEN)
+            prolog["chemical_units"] = self._read_str(f, _ID_LEN)
 
-            # Read input file name
-            input_name = f.read(260).decode('ascii', errors='replace').strip('\x00').strip()
-            prolog["input_file"] = input_name
-
-            # Read report file name
-            report_name = f.read(260).decode('ascii', errors='replace').strip('\x00').strip()
-            prolog["report_file"] = report_name
-
-            # Read chemical name and concentration units
-            chem_name = f.read(32).decode('ascii', errors='replace').strip('\x00').strip()
-            prolog["chemical_name"] = chem_name
-
-            chem_units = f.read(32).decode('ascii', errors='replace').strip('\x00').strip()
-            prolog["chemical_units"] = chem_units
-
-            # Read node IDs
-            node_ids = []
-            for _ in range(prolog["num_nodes"]):
-                node_id = f.read(32).decode('ascii', errors='replace').strip('\x00').strip()
-                node_ids.append(node_id)
+            # Node and link IDs
+            node_ids = [self._read_str(f, _ID_LEN) for _ in range(num_nodes)]
+            link_ids = [self._read_str(f, _ID_LEN) for _ in range(num_links)]
             prolog["node_ids"] = node_ids
-
-            # Read link IDs
-            link_ids = []
-            for _ in range(prolog["num_links"]):
-                link_id = f.read(32).decode('ascii', errors='replace').strip('\x00').strip()
-                link_ids.append(link_id)
             prolog["link_ids"] = link_ids
 
+            # Link end nodes and types (file holds 1-based node indices)
+            start_nodes = [i - 1 for i in self._read_ints(f, num_links)]
+            end_nodes = [i - 1 for i in self._read_ints(f, num_links)]
+            link_types = self._read_ints(f, num_links)
+
+            # Tanks and reservoirs: node index and cross-section area
+            # (area is 0 for a reservoir)
+            tank_nodes = [i - 1 for i in self._read_ints(f, num_tanks)]
+            tank_areas = self._read_floats(f, num_tanks)
+
+            # Node elevations, link lengths and link diameters (pumps: 0)
+            elevations = self._read_floats(f, num_nodes)
+            lengths = self._read_floats(f, num_links)
+            diameters = self._read_floats(f, num_links)
+
+            def _id(ids: List[str], i: int) -> Optional[str]:
+                return ids[i] if 0 <= i < len(ids) else None
+
+            prolog["link_start_node_indices"] = start_nodes
+            prolog["link_end_node_indices"] = end_nodes
+            prolog["link_start_node_ids"] = [_id(node_ids, i) for i in start_nodes]
+            prolog["link_end_node_ids"] = [_id(node_ids, i) for i in end_nodes]
+            prolog["link_types"] = link_types
+            prolog["link_type_names"] = [LINK_TYPE_NAMES.get(t, str(t)) for t in link_types]
+            prolog["tank_node_indices"] = tank_nodes
+            prolog["tank_ids"] = [_id(node_ids, i) for i in tank_nodes]
+            prolog["tank_areas"] = tank_areas
+            prolog["node_elevations"] = elevations
+            prolog["link_lengths"] = lengths
+            prolog["link_diameters"] = diameters
+
+            node_types = ["JUNCTION"] * num_nodes
+            for i, area in zip(tank_nodes, tank_areas):
+                if 0 <= i < num_nodes:
+                    node_types[i] = "TANK" if area > 0 else "RESERVOIR"
+            prolog["node_types"] = node_types
+
+            prolog["prolog_bytes"] = f.tell()
             prolog["valid"] = True
 
-        except (struct.error, IOError) as e:
+        except (struct.error, IOError, ValueError) as e:
             prolog["error"] = str(e)
 
         return prolog
 
-    def _read_energy_usage(self, f, num_pumps: int) -> List[Dict[str, Any]]:
-        """Read energy usage section."""
-        energy = []
+    def _read_energy_usage(self, f, num_pumps: int, link_ids: List[str]):
+        """
+        Read the energy usage section.
+
+        Returns:
+            (records, peak_demand_cost). One record per pump: pump_index
+            (0-based ordinal among pumps), link_index (0-based), link_id,
+            percent_utilization, avg_efficiency (%), kwh_per_flow (kWh per
+            MG or per m3), avg_kw, peak_kw, cost_per_day.
+        """
+        energy: List[Dict[str, Any]] = []
+        peak_demand_cost: Optional[float] = None
 
         try:
-            for _ in range(num_pumps):
-                pump_energy = {
-                    "pump_index": struct.unpack('i', f.read(4))[0],
-                    "link_index": struct.unpack('i', f.read(4))[0],
-                    "percent_utilization": struct.unpack('f', f.read(4))[0],
-                    "avg_efficiency": struct.unpack('f', f.read(4))[0],
-                    "kwh_per_flow": struct.unpack('f', f.read(4))[0],
-                    "avg_kw": struct.unpack('f', f.read(4))[0],
-                    "peak_kw": struct.unpack('f', f.read(4))[0],
-                    "cost_per_day": struct.unpack('f', f.read(4))[0]
-                }
-                energy.append(pump_energy)
+            for p in range(num_pumps):
+                link_index = struct.unpack('<i', f.read(4))[0] - 1
+                (utilization, efficiency, kwh_per_flow, avg_kw, peak_kw,
+                 cost_per_day) = struct.unpack('<6f', f.read(24))
+                energy.append({
+                    "pump_index": p,
+                    "link_index": link_index,
+                    "link_id": link_ids[link_index] if 0 <= link_index < len(link_ids) else None,
+                    "percent_utilization": utilization,
+                    "avg_efficiency": efficiency,
+                    "kwh_per_flow": kwh_per_flow,
+                    "avg_kw": avg_kw,
+                    "peak_kw": peak_kw,
+                    "cost_per_day": cost_per_day,
+                })
 
-            # Read peak demand cost (consumed but not yet surfaced —
-            # placeholder until we attach it to the energy summary).
-            if num_pumps > 0:
-                _ = struct.unpack('f', f.read(4))[0]
+            # Peak demand cost is written even when there are no pumps.
+            peak_demand_cost = struct.unpack('<f', f.read(4))[0]
 
         except (struct.error, IOError):
             pass
 
-        return energy
+        return energy, peak_demand_cost
 
     def _read_time_series(self, f, num_nodes: int, num_links: int, num_periods: int) -> Dict[str, List]:
-        """Read dynamic results (time series data)."""
+        """Read dynamic results (time series data) from the current offset."""
         time_series = {"nodes": [], "links": []}
+        node_fmt = f'<{_NODE_VARS * num_nodes}f'
+        link_fmt = f'<{_LINK_VARS * num_links}f'
+        node_bytes = 4 * _NODE_VARS * num_nodes
+        link_bytes = 4 * _LINK_VARS * num_links
+        n, l = num_nodes, num_links
 
         try:
             for _ in range(num_periods):
-                # Read node results for this period
-                node_results = []
-
-                # Demand for all nodes
-                demands = struct.unpack(f'{num_nodes}f', f.read(4 * num_nodes))
-
-                # Head for all nodes
-                heads = struct.unpack(f'{num_nodes}f', f.read(4 * num_nodes))
-
-                # Pressure for all nodes
-                pressures = struct.unpack(f'{num_nodes}f', f.read(4 * num_nodes))
-
-                # Quality for all nodes
-                qualities = struct.unpack(f'{num_nodes}f', f.read(4 * num_nodes))
-
-                for i in range(num_nodes):
-                    node_results.append({
+                v = struct.unpack(node_fmt, f.read(node_bytes))
+                demands, heads = v[0:n], v[n:2 * n]
+                pressures, qualities = v[2 * n:3 * n], v[3 * n:4 * n]
+                time_series["nodes"].append([
+                    {
                         "node_index": i,
                         "demand": demands[i],
                         "head": heads[i],
                         "pressure": pressures[i],
-                        "quality": qualities[i]
-                    })
+                        "quality": qualities[i],
+                    }
+                    for i in range(n)
+                ])
 
-                time_series["nodes"].append(node_results)
-
-                # Read link results for this period
-                link_results = []
-
-                # Flow for all links
-                flows = struct.unpack(f'{num_links}f', f.read(4 * num_links))
-
-                # Velocity for all links
-                velocities = struct.unpack(f'{num_links}f', f.read(4 * num_links))
-
-                # Headloss for all links
-                headlosses = struct.unpack(f'{num_links}f', f.read(4 * num_links))
-
-                # Average quality for all links
-                avg_qualities = struct.unpack(f'{num_links}f', f.read(4 * num_links))
-
-                # Status for all links
-                statuses = struct.unpack(f'{num_links}f', f.read(4 * num_links))
-
-                # Setting for all links
-                settings = struct.unpack(f'{num_links}f', f.read(4 * num_links))
-
-                # Reaction rate for all links
-                reaction_rates = struct.unpack(f'{num_links}f', f.read(4 * num_links))
-
-                # Friction factor for all links
-                friction_factors = struct.unpack(f'{num_links}f', f.read(4 * num_links))
-
-                for i in range(num_links):
-                    link_results.append({
+                v = struct.unpack(link_fmt, f.read(link_bytes))
+                cols = [v[k * l:(k + 1) * l] for k in range(_LINK_VARS)]
+                (flows, velocities, headlosses, avg_qualities, statuses,
+                 settings, reaction_rates, friction_factors) = cols
+                time_series["links"].append([
+                    {
                         "link_index": i,
                         "flow": flows[i],
                         "velocity": velocities[i],
@@ -309,42 +412,33 @@ class EpanetOutputDecoder:
                         "status": statuses[i],
                         "setting": settings[i],
                         "reaction_rate": reaction_rates[i],
-                        "friction_factor": friction_factors[i]
-                    })
-
-                time_series["links"].append(link_results)
+                        "friction_factor": friction_factors[i],
+                    }
+                    for i in range(l)
+                ])
 
         except (struct.error, IOError):
             pass
 
         return time_series
 
-    def _read_epilog(self, f) -> Dict[str, Any]:
-        """Read epilog section."""
-        epilog = {}
+    def _read_epilog(self, f, file_size: int) -> Dict[str, Any]:
+        """Read the epilog (the last 28 bytes of the file)."""
+        epilog: Dict[str, Any] = {}
 
+        if file_size < _EPILOG_BYTES:
+            return epilog
         try:
-            # Read average bulk reaction rate
-            epilog["avg_bulk_reaction_rate"] = struct.unpack('f', f.read(4))[0]
-
-            # Read average wall reaction rate
-            epilog["avg_wall_reaction_rate"] = struct.unpack('f', f.read(4))[0]
-
-            # Read average tank reaction rate
-            epilog["avg_tank_reaction_rate"] = struct.unpack('f', f.read(4))[0]
-
-            # Read average source inflow rate
-            epilog["avg_source_inflow_rate"] = struct.unpack('f', f.read(4))[0]
-
-            # Read number of reporting periods
-            epilog["num_periods"] = struct.unpack('i', f.read(4))[0]
-
-            # Read warning flag
-            epilog["warning_flag"] = struct.unpack('i', f.read(4))[0]
-
-            # Read magic number (should match)
-            epilog["magic_number"] = struct.unpack('i', f.read(4))[0]
-
+            f.seek(file_size - _EPILOG_BYTES)
+            (bulk, wall, tank, source, num_periods, warning_flag,
+             magic) = struct.unpack('<4f3i', f.read(_EPILOG_BYTES))
+            epilog["avg_bulk_reaction_rate"] = bulk
+            epilog["avg_wall_reaction_rate"] = wall
+            epilog["avg_tank_reaction_rate"] = tank
+            epilog["avg_source_inflow_rate"] = source
+            epilog["num_periods"] = num_periods
+            epilog["warning_flag"] = warning_flag
+            epilog["magic_number"] = magic
         except (struct.error, IOError):
             pass
 
