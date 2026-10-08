@@ -124,6 +124,17 @@ class EpanetInputDecoder:
         "LABELS": ["x_coord", "y_coord", "label", "anchor"],
     }
 
+    # Columns that hold an element / pattern / curve identifier. EPANET ids
+    # are labels, not numbers: ``7010`` and ``07010`` are different nodes,
+    # and the binary .out names every node and link as a string. Converting
+    # them to int (as ``_convert_value`` does for data columns) made the
+    # decoded model disagree with the .out, so joins by id silently missed
+    # (features lost their type and coordinates). Keep them as strings.
+    ID_COLUMNS = {
+        "id", "node1", "node2", "junction", "node", "link", "tank",
+        "pattern", "vol_curve", "object_id", "category", "tag",
+    }
+
     def __init__(self):
         """Initialize the decoder."""
         pass
@@ -555,7 +566,10 @@ class EpanetInputDecoder:
         row = {}
         for i, col in enumerate(columns):
             if i < len(parts):
-                row[col] = self._convert_value(parts[i])
+                row[col] = (
+                    parts[i] if col in self.ID_COLUMNS
+                    else self._convert_value(parts[i])
+                )
             else:
                 row[col] = None
 

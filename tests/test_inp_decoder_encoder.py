@@ -46,7 +46,7 @@ class TestEpanetInputDecoder:
         assert len(junctions) == 9
 
         # Find junction 10
-        j10 = next((j for j in junctions if j["id"] == 10), None)
+        j10 = next((j for j in junctions if j["id"] == "10"), None)
         assert j10 is not None
         assert j10["elevation"] == 710
 
@@ -54,14 +54,14 @@ class TestEpanetInputDecoder:
         """Test reservoir parsing."""
         reservoirs = sample_model.get("reservoirs", [])
         assert len(reservoirs) == 1
-        assert reservoirs[0]["id"] == 9
+        assert reservoirs[0]["id"] == "9"
         assert reservoirs[0]["head"] == 800
 
     def test_decode_tanks(self, sample_model):
         """Test tank parsing."""
         tanks = sample_model.get("tanks", [])
         assert len(tanks) == 1
-        assert tanks[0]["id"] == 2
+        assert tanks[0]["id"] == "2"
 
     def test_decode_pipes(self, sample_model):
         """Test pipe parsing."""
@@ -72,7 +72,7 @@ class TestEpanetInputDecoder:
         """Test pump parsing."""
         pumps = sample_model.get("pumps", [])
         assert len(pumps) == 1
-        assert pumps[0]["id"] == 9
+        assert pumps[0]["id"] == "9"
 
     def test_decode_patterns(self, sample_model):
         """Test pattern parsing."""
@@ -412,3 +412,84 @@ class TestRoundTrip:
 
             assert len(original["junctions"]) == len(reloaded["junctions"])
             assert len(original["pipes"]) == len(reloaded["pipes"])
+
+
+
+class TestNumericIdsStayStrings:
+    """EPANET ids are labels. A numeric-looking id (reservoir ``7010``) must
+    decode as the string the .out uses, or joins by id miss."""
+
+    INP = """[TITLE]
+numeric ids
+
+[JUNCTIONS]
+;ID   Elev   Demand   Pattern
+ 07010  100    5        2
+ J-1    101    0
+
+[RESERVOIRS]
+ 7010   250
+
+[PIPES]
+ 101   7010   07010   1000  12  100  0  Open
+ 102   07010  J-1     500   8   100  0  Open
+
+[DEMANDS]
+ 07010  3  2  10
+
+[PATTERNS]
+ 2   1.0  1.2
+
+[COORDINATES]
+ 7010   1.5  2.5
+ 07010  3.0  4.0
+
+[END]
+"""
+
+    def test_ids_are_strings_and_keep_leading_zeros(self, tmp_path):
+        path = tmp_path / "ids.inp"
+        path.write_text(self.INP)
+        model = EpanetInputDecoder().decode_inp(path)
+        assert [j["id"] for j in model["junctions"]] == ["07010", "J-1"]
+        assert model["junctions"][0]["pattern"] == "2"
+        assert model["junctions"][0]["elevation"] == 100  # data stays numeric
+        assert model["reservoirs"][0]["id"] == "7010"
+        pipe = model["pipes"][0]
+        assert (pipe["id"], pipe["node1"], pipe["node2"]) == ("101", "7010", "07010")
+        assert pipe["length"] == 1000
+        assert model["demands"][0]["junction"] == "07010"
+        assert model["demands"][0]["category"] == "10"
+        assert {c["node"] for c in model["coordinates"]} == {"7010", "07010"}
+
+    def test_round_trip_keeps_ids(self, tmp_path):
+        path = tmp_path / "ids.inp"
+        path.write_text(self.INP)
+        model = EpanetInputDecoder().decode_inp(path)
+        out = tmp_path / "round.inp"
+        EpanetInputEncoder().encode_to_inp_file(model, out)
+        again = EpanetInputDecoder().decode_inp(out)
+        assert [j["id"] for j in again["junctions"]] == ["07010", "J-1"]
+        assert again["reservoirs"][0]["id"] == "7010"
+
+    def test_element_types_keyed_like_the_out_file(self, tmp_path):
+        from epanet_utils.exports import _classify_element_types
+
+        path = tmp_path / "ids.inp"
+        path.write_text(self.INP)
+        types = _classify_element_types(path)
+        assert types["7010"] == "reservoir"
+        assert types["07010"] == "junction"
+        assert types["101"] == "pipe"
+
+    def test_net1_out_ids_all_classified(self):
+        """Every node/link id in Net1's .out (all numeric) gets a type."""
+        from epanet_utils import EpanetOutput
+        from epanet_utils.exports import _classify_element_types
+
+        fixtures = Path(__file__).parent / "fixtures" / "out"
+        types = _classify_element_types(fixtures / "net1.inp")
+        with EpanetOutput(fixtures / "net1.out") as ep:
+            ids = list(ep.node_ids) + list(ep.link_ids)
+        assert ids and all(i in types for i in ids)
+        assert types["9"] in {"reservoir", "pump"}

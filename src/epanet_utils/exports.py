@@ -756,8 +756,11 @@ def _classify_element_types(inp_path: PathLike) -> Dict[str, str]:
     ):
         for row in model.get(section, []) or []:
             fid = row.get("id") or row.get("name") or row.get("node")
-            if fid:
-                out[fid] = element_type
+            if fid is not None and fid != "":
+                # str(): models decoded by older releases (or loaded from
+                # JSON written by them) carry numeric ids as ints, while the
+                # .out names every element as a string.
+                out[str(fid)] = element_type
     return out
 
 
@@ -878,7 +881,7 @@ def emit_results_zarr(
     inp = decoder.decode_inp(Path(inp_path))
     # The decoder uses keys "node", "x_coord", "y_coord" for coordinates.
     coords_by_id: Dict[str, tuple] = {
-        c.get("node") or c.get("id"): (c.get("x_coord", c.get("x")), c.get("y_coord", c.get("y")))
+        str(c.get("node") or c.get("id")): (c.get("x_coord", c.get("x")), c.get("y_coord", c.get("y")))
         for c in inp.get("coordinates", []) or []
         if c.get("node") or c.get("id")
     }
